@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 
 from src.data_loader import (
     WEEK_COLS_METRICS,
+    WEEK_COLS_ORDERS,
     WEEK_LABELS,
     get_country_averages,
     get_dataset_summary,
@@ -24,7 +25,7 @@ from src.data_loader import (
 if TYPE_CHECKING:
     from src.providers.base import LLMProvider
 
-MAX_TOKENS    = 1600
+MAX_TOKENS    = 2500
 HISTORY_PAIRS = 6
 
 _TEMPORAL_RE = re.compile(
@@ -91,6 +92,31 @@ _ORDERS_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ZONE_TYPE_RE = re.compile(
+    r"\b(?:wealthy|non.?wealthy|zona\s+(?:rica|no\s+rica)|"
+    r"tipo\s+de\s+zona|por\s+tipo\s+de\s+zona|segmento\s+de\s+zona|"
+    r"zonas?\s+ricas?|zonas?\s+no\s+ricas?)\b",
+    re.IGNORECASE,
+)
+
+# ── Prioritization filter detection ───────────────────────────────────────────
+_PRIO_HIGH_RE = re.compile(
+    r"\b(?:high\s*priority|alta\s+prioridad|alta\s+priorizaci[oó]n|prioridad\s+alta)\b",
+    re.IGNORECASE,
+)
+_PRIO_MED_RE = re.compile(
+    r"\b(?:medium\s*priority|media\s+prioridad|prioridad\s+media)\b",
+    re.IGNORECASE,
+)
+_PRIO_LOW_RE = re.compile(
+    r"\b(?:low\s*priority|baja\s+prioridad|prioridad\s+baja)\b",
+    re.IGNORECASE,
+)
+_PRIO_ANY_RE = re.compile(
+    r"\bzonas?\s+prioritarias?\b|\bzonas?\s+priorizadas?\b",
+    re.IGNORECASE,
+)
+
 _TOP_N_RE = re.compile(
     r"\btop\s*(\d+)\b|(?:las?|los?)\s+(\d+)\s+(?:mejores?|peores?|zonas?|pa[íi]ses?|principales?)",
     re.IGNORECASE,
@@ -100,6 +126,17 @@ _N_WEEKS_RE = re.compile(
     r"[úu]ltimas?\s+(\d+)\s+semanas?|(\d+)\s+semanas?\s+(?:atr[aá]s?|anteriores?)",
     re.IGNORECASE,
 )
+
+# Words that appear frequently in analytics questions but never in zone/city names
+_ENTITY_STOP_WORDS = frozenset([
+    "pedidos", "ordenes", "metricas", "semanas", "semana", "evolucion",
+    "tendencia", "historico", "historica", "promedio", "calidad", "perfect",
+    "orders", "turbo", "retail", "gross", "profit", "adoption", "penetration",
+    "conversion", "restaurants", "markdowns", "sessions", "optimal",
+    "assortment", "breakeven", "ultimas", "ultima", "rappi", "latam",
+    "colombia", "argentina", "brasil", "brazil", "chile", "ecuador",
+    "mexico", "uruguay", "weekly", "zonas", "paises", "ciudades",
+])
 
 
 def _extract_top_n(question: str, default: int = 10) -> int:
@@ -112,6 +149,9 @@ def _extract_top_n(question: str, default: int = 10) -> int:
 
 
 def _extract_n_weeks(question: str, default: int = 4) -> int:
+    # "esta semana" / "SaS" / "semana a semana" → W-1 → W-0 (single-week comparison)
+    if re.search(r"\besta\s+semana\b|\bsemana\s+a\s+semana\b|\bSaS\b", question, re.IGNORECASE):
+        return 1
     m = _N_WEEKS_RE.search(question)
     if m:
         val = m.group(1) or m.group(2)
@@ -153,12 +193,28 @@ def detect_question_intent(question: str, metrics_df: pd.DataFrame) -> dict:
 
     temporal = bool(_TEMPORAL_RE.search(question))
 
-    # Metric — longest match first
+    # Metric — longest match first (exact substring)
     matched_metric = None
     for m in sorted(metrics_list, key=len, reverse=True):
         if m.lower() in q_low:
             matched_metric = m
             break
+
+    # Fuzzy fallback: word-stem overlap for pluralization / partial names
+    # e.g. "Perfect Order" → matches "Perfect Orders", "Adoption" → "Turbo Adoption"
+    if not matched_metric:
+        def _wstem(w: str) -> str:
+            for sfx in ("tion", "sion", "ing", "ers", "es", "s"):
+                if w.endswith(sfx) and len(w) > len(sfx) + 3:
+                    return w[: -len(sfx)]
+            return w
+        q_stems = {_wstem(w) for w in re.findall(r"\b\w{4,}\b", q_low)}
+        for m in sorted(metrics_list, key=len, reverse=True):
+            m_stems = {_wstem(w) for w in re.findall(r"\b\w{4,}\b", m.lower())}
+            # Require ≥2 distinctive stems to avoid false positives on short/abbrev names
+            if len(m_stems) >= 2 and m_stems <= q_stems:
+                matched_metric = m
+                break
 
     # Country — 2-letter code or full name
     _COUNTRY_NAMES = {
@@ -184,6 +240,18 @@ def detect_question_intent(question: str, metrics_df: pd.DataFrame) -> dict:
         if len(city) >= 4 and city.lower() in q_low:
             matched_city = city
             break
+    # Reverse match: question word contained in city name (e.g. "medellin" ⊂ "MEDELLIN NORTE")
+    if not matched_city:
+        _q_words = sorted(re.findall(r'\b\w{5,}\b', q_low), key=len, reverse=True)
+        for _w in _q_words:
+            if _w in _ENTITY_STOP_WORDS:
+                continue
+            for city in sorted(cities, key=len, reverse=True):
+                if _w in city.lower():
+                    matched_city = city
+                    break
+            if matched_city:
+                break
 
     # Zone — longest match first, min 4 chars
     matched_zone = None
@@ -191,6 +259,18 @@ def detect_question_intent(question: str, metrics_df: pd.DataFrame) -> dict:
         if len(zone) >= 4 and zone.lower() in q_low:
             matched_zone = zone
             break
+    # Reverse match: question word contained in zone name (e.g. "maschwitz" ⊂ "GRAL MASCHWITZ")
+    if not matched_zone:
+        _q_words = sorted(re.findall(r'\b\w{5,}\b', q_low), key=len, reverse=True)
+        for _w in _q_words:
+            if _w in _ENTITY_STOP_WORDS:
+                continue
+            for zone in sorted(zones, key=len, reverse=True):
+                if _w in zone.lower() and len(zone) >= 4:
+                    matched_zone = zone
+                    break
+            if matched_zone:
+                break
 
     # ── Intent type classification ────────────────────────────────────────────
     intent_types: list[str] = []
@@ -204,16 +284,30 @@ def detect_question_intent(question: str, metrics_df: pd.DataFrame) -> dict:
         intent_types.append("comparison")
     if _OPPORTUNITY_RE.search(question):
         intent_types.append("opportunity")
+    if _ZONE_TYPE_RE.search(question):
+        intent_types.append("zone_type_comparison")
     if temporal:
         intent_types.append("temporal")
 
+    # Prioritization filter — checked in specificity order: high > medium > low > generic
+    prioritization: str | None = None
+    if _PRIO_HIGH_RE.search(question):
+        prioritization = "High Priority"
+    elif _PRIO_MED_RE.search(question):
+        prioritization = "Prioritized"
+    elif _PRIO_LOW_RE.search(question):
+        prioritization = "Not Prioritized"
+    elif _PRIO_ANY_RE.search(question):
+        prioritization = "High Priority"   # "zonas prioritarias" defaults to high
+
     return {
-        "temporal":     temporal,
-        "intent_types": intent_types,
-        "metric":       matched_metric,
-        "country":      matched_country,
-        "city":         matched_city,
-        "zone":         matched_zone,
+        "temporal":       temporal,
+        "intent_types":   intent_types,
+        "metric":         matched_metric,
+        "country":        matched_country,
+        "city":           matched_city,
+        "zone":           matched_zone,
+        "prioritization": prioritization,
     }
 
 
@@ -239,11 +333,6 @@ def build_entity_context(metrics_df: pd.DataFrame, intent: dict) -> str:
 
     parts: list[str] = ["", "=== DATOS HISTORICOS DETALLADOS ==="]
 
-    # Determine which metrics to show
-    metrics_to_show = [metric] if metric else (
-        metrics_df["METRIC"].dropna().unique().tolist()[:3]  # top-3 fallback
-    )
-
     # ── Zone-level series ─────────────────────────────────────────────────────
     if zone:
         zone_mask = metrics_df["ZONE"].str.lower() == zone.lower()
@@ -253,17 +342,50 @@ def build_entity_context(metrics_df: pd.DataFrame, intent: dict) -> str:
             )
         zone_df = metrics_df[zone_mask]
 
-        for m in metrics_to_show:
+        if zone_df.empty:
+            parts.append(
+                f"\nNota: Zona '{zone}' no encontrada en el dataset. "
+                "Verifica el nombre exacto (puede diferir en mayúsculas o abreviatura)."
+            )
+        else:
+            # Availability scan: which metrics have non-null weekly series
+            _avail: list[str] = []
+            for _m in metrics_df["METRIC"].dropna().unique():
+                _sub = zone_df[zone_df["METRIC"] == _m]
+                if not _sub.empty:
+                    _row = _sub.iloc[0]
+                    if any(c in _row.index and pd.notna(_row[c]) for c in cols):
+                        _avail.append(_m)
+            _r0 = zone_df.iloc[0]
+            parts.append(
+                f"\nZona detectada: {_r0['ZONE']}"
+                f" ({_r0.get('CITY', '')}, {_r0.get('COUNTRY', '')})"
+            )
+            parts.append(
+                f"Métricas con datos históricos disponibles ({len(_avail)}): "
+                + (", ".join(_avail) if _avail else "ninguna")
+            )
+
+        # Show series — all zone-available metrics when no specific metric requested
+        _mshow = [metric] if metric else (
+            zone_df["METRIC"].dropna().unique().tolist() if not zone_df.empty else []
+        )
+        for m in _mshow:
             sub = zone_df[zone_df["METRIC"] == m]
             if sub.empty:
                 continue
             row = sub.iloc[0]
+            week_vals = [
+                (c, lbl) for c, lbl in zip(cols, labels)
+                if c in row.index and pd.notna(row[c])
+            ]
+            if not week_vals:
+                continue
             parts.append(
                 f"\n{m} — Zona: {row['ZONE']} ({row['CITY']}, {row['COUNTRY']})"
             )
-            for col, lbl in zip(cols, labels):
-                if col in row.index and pd.notna(row[col]):
-                    parts.append(f"  {lbl}: {float(row[col]):.4f}")
+            for col, lbl in week_vals:
+                parts.append(f"  {lbl}: {float(row[col]):.4f}")
 
         if len(parts) > 2 and country is None and city is None:
             return "\n".join(parts)
@@ -277,7 +399,33 @@ def build_entity_context(metrics_df: pd.DataFrame, intent: dict) -> str:
             )
         city_df = metrics_df[city_mask]
 
-        for m in metrics_to_show:
+        if city_df.empty:
+            parts.append(
+                f"\nNota: Ciudad '{city}' no encontrada en el dataset. "
+                "Verifica el nombre exacto."
+            )
+        else:
+            # Availability scan
+            _avail_c: list[str] = []
+            for _m in metrics_df["METRIC"].dropna().unique():
+                _sub = city_df[city_df["METRIC"] == _m]
+                if not _sub.empty:
+                    if any(
+                        c in city_df.columns and pd.notna(_sub[c].mean())
+                        for c in cols
+                    ):
+                        _avail_c.append(_m)
+            _c0 = city_df.iloc[0]
+            parts.append(f"\nCiudad detectada: {_c0['CITY']} ({_c0.get('COUNTRY', '')})")
+            parts.append(
+                f"Métricas con datos históricos disponibles ({len(_avail_c)}): "
+                + (", ".join(_avail_c) if _avail_c else "ninguna")
+            )
+
+        _mshow_c = [metric] if metric else (
+            city_df["METRIC"].dropna().unique().tolist() if not city_df.empty else []
+        )
+        for m in _mshow_c:
             sub = city_df[city_df["METRIC"] == m]
             if sub.empty:
                 continue
@@ -296,7 +444,8 @@ def build_entity_context(metrics_df: pd.DataFrame, intent: dict) -> str:
     # ── Country-level series ───────────────────────────────────────────────────
     if country:
         c_df = metrics_df[metrics_df["COUNTRY"] == country.upper()]
-        for m in metrics_to_show:
+        _mshow_cty = [metric] if metric else metrics_df["METRIC"].dropna().unique().tolist()[:3]
+        for m in _mshow_cty:
             sub = c_df[c_df["METRIC"] == m]
             if sub.empty:
                 continue
@@ -336,12 +485,43 @@ def build_entity_context(metrics_df: pd.DataFrame, intent: dict) -> str:
 
 # ── Query-aware analytics computation ─────────────────────────────────────────
 
+def _apply_priority_filter(df: pd.DataFrame, prioritization: str | None) -> pd.DataFrame:
+    """
+    Filter DataFrame rows by ZONE_PRIORITIZATION.
+    Falls back to the full df when the column is absent or no rows match,
+    so the caller always gets a non-empty result if the data exists at all.
+    """
+    if not prioritization or "ZONE_PRIORITIZATION" not in df.columns:
+        return df
+    col = df["ZONE_PRIORITIZATION"].fillna("").str.strip()
+    exact = df[col == prioritization]
+    if not exact.empty:
+        return exact
+    # Partial match: "High" matches "High Priority", etc.
+    key = prioritization.split()[0]
+    partial = df[col.str.contains(re.escape(key), case=False, na=False)]
+    return partial if not partial.empty else df
+
+
+def _md_table(headers: list[str], rows: list[list]) -> list[str]:
+    """Return lines forming a markdown table ready to embed in the context string."""
+    sep   = ["---"] * len(headers)
+    lines = [
+        "| " + " | ".join(str(h) for h in headers) + " |",
+        "| " + " | ".join(sep) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(v) for v in row) + " |")
+    return lines
+
+
 def compute_order_growth_ranking(
     orders_df: pd.DataFrame,
     n: int = 10,
     n_weeks: int = 4,
     country: str | None = None,
     ascending: bool = False,
+    prioritization: str | None = None,
 ) -> pd.DataFrame:
     """Rank zones by order volume % growth from W-{n_weeks} to W-0."""
     mask = orders_df["METRIC"] == "Orders"
@@ -359,8 +539,9 @@ def compute_order_growth_ranking(
 
     select_cols = [c for c in ["COUNTRY", "CITY", "ZONE", base_col, recent_col]
                    if c in orders_df.columns]
-    work = orders_df.loc[mask, select_cols].dropna().copy()
+    work = orders_df.loc[mask, select_cols].dropna(subset=[base_col, recent_col]).copy()
     work = work[work[base_col] > 0]
+    work = _apply_priority_filter(work, prioritization)
     work["growth_pct"]     = (work[recent_col] - work[base_col]) / work[base_col] * 100
     work["base_orders"]    = work[base_col]
     work["current_orders"] = work[recent_col]
@@ -398,6 +579,7 @@ def compute_metric_growth_ranking(
     n_weeks: int = 4,
     country: str | None = None,
     ascending: bool = False,
+    prioritization: str | None = None,
 ) -> pd.DataFrame:
     """Rank zones by metric value % growth from W-{n_weeks} to W-0."""
     mask = metrics_df["METRIC"] == metric
@@ -413,10 +595,12 @@ def compute_metric_growth_ranking(
     if recent_col not in metrics_df.columns:
         return pd.DataFrame()
 
-    select_cols = [c for c in ["COUNTRY", "CITY", "ZONE", base_col, recent_col]
+    select_cols = [c for c in
+                   ["COUNTRY", "CITY", "ZONE", "ZONE_PRIORITIZATION", base_col, recent_col]
                    if c in metrics_df.columns]
-    work = metrics_df.loc[mask, select_cols].dropna().copy()
+    work = metrics_df.loc[mask, select_cols].dropna(subset=[base_col, recent_col]).copy()
     work = work[work[base_col].abs() > 1e-6]
+    work = _apply_priority_filter(work, prioritization)
     work["growth_pct"]  = (work[recent_col] - work[base_col]) / work[base_col].abs() * 100
     work["base_val"]    = work[base_col]
     work["current_val"] = work[recent_col]
@@ -429,6 +613,7 @@ def compute_extended_metric_ranking(
     n: int = 10,
     country: str | None = None,
     ascending: bool = False,
+    prioritization: str | None = None,
 ) -> pd.DataFrame:
     """Top-N zones by current metric value (W-0) including WoW change."""
     mask = metrics_df["METRIC"] == metric
@@ -440,6 +625,7 @@ def compute_extended_metric_ranking(
                     "L0W_ROLL", "L1W_ROLL"]
                    if c in metrics_df.columns]
     work = metrics_df.loc[mask, select_cols].dropna(subset=["L0W_ROLL"]).copy()
+    work = _apply_priority_filter(work, prioritization)
     if "L1W_ROLL" in work.columns:
         valid = work["L1W_ROLL"].abs() > 1e-6
         work.loc[valid, "wow_pct"] = (
@@ -454,6 +640,7 @@ def compute_extended_order_ranking(
     n: int = 10,
     country: str | None = None,
     ascending: bool = False,
+    prioritization: str | None = None,
 ) -> pd.DataFrame:
     """Top-N zones by current order volume (W-0) including WoW change."""
     mask = orders_df["METRIC"] == "Orders"
@@ -464,6 +651,7 @@ def compute_extended_order_ranking(
     select_cols = [c for c in ["COUNTRY", "CITY", "ZONE"] + week_cols
                    if c in orders_df.columns]
     work = orders_df.loc[mask, select_cols].dropna(subset=["L0W"]).copy()
+    work = _apply_priority_filter(work, prioritization)
     if "L1W" in work.columns:
         valid = work["L1W"] > 0
         work.loc[valid, "wow_pct"] = (
@@ -503,6 +691,110 @@ def compute_opportunity_analysis(
     return work.sort_values("gap_pct", ascending=False).head(n).reset_index(drop=True)
 
 
+def compute_intent_chart(
+    metrics_df: pd.DataFrame,
+    orders_df: pd.DataFrame,
+    intent: dict,
+    question: str,
+) -> "go.Figure | None":
+    """
+    Build a Plotly chart from the EXACT same filtered data as compute_query_analytics.
+    Returns None for non-ranking intents so callers fall back to AI-generated chart specs.
+    """
+    intent_types  = intent.get("intent_types", [])
+    ranking_types = {"growth_ranking", "decline_ranking", "ranking"}
+    if not (ranking_types & set(intent_types)):
+        return None
+
+    metric          = intent.get("metric")
+    country         = intent.get("country")
+    prioritization  = intent.get("prioritization")
+    top_n           = _extract_top_n(question)
+    n_weeks         = _extract_n_weeks(question)
+    mentions_orders = bool(_ORDERS_RE.search(question))
+    wants_bottom    = bool(_BOTTOM_RE.search(question))
+    prio_label      = f" [{prioritization}]" if prioritization else ""
+    scope           = f" — {country}" if country else " — LATAM"
+
+    def _zone_labels(df: pd.DataFrame) -> list[str]:
+        return [
+            f"{z[:22]}… ({c})" if len(z) > 22 else f"{z} ({c})"
+            for z, c in zip(df["ZONE"].tolist(), df["COUNTRY"].tolist())
+        ]
+
+    try:
+        # ── Growth ranking ────────────────────────────────────────────────────
+        if "growth_ranking" in intent_types:
+            if metric:
+                df = compute_metric_growth_ranking(
+                    metrics_df, metric, n=top_n, n_weeks=n_weeks, country=country,
+                    prioritization=prioritization,
+                )
+                if not df.empty:
+                    df = df.sort_values("growth_pct")  # best growth last → top bar highlighted
+                    title = f"Crecimiento {metric} · W-{n_weeks}→W-0{scope}{prio_label}"
+                    return _chart_hbar(_zone_labels(df), df["growth_pct"].tolist(), title, fmt="+.1f")
+            else:
+                df = compute_order_growth_ranking(
+                    orders_df, n=top_n, n_weeks=n_weeks, country=country,
+                    prioritization=prioritization,
+                )
+                if not df.empty:
+                    df = df.sort_values("growth_pct")
+                    title = f"Crecimiento Órdenes · W-{n_weeks}→W-0{scope}{prio_label}"
+                    return _chart_hbar(_zone_labels(df), df["growth_pct"].tolist(), title, fmt="+.1f")
+
+        # ── Decline ranking ───────────────────────────────────────────────────
+        if "decline_ranking" in intent_types:
+            if metric:
+                df = compute_metric_growth_ranking(
+                    metrics_df, metric, n=top_n, n_weeks=n_weeks, country=country,
+                    ascending=True, prioritization=prioritization,
+                )
+                if not df.empty:
+                    df = df.sort_values("growth_pct", ascending=False)  # worst decline last → top bar
+                    title = f"Mayor Caída {metric} · W-{n_weeks}→W-0{scope}{prio_label}"
+                    return _chart_hbar(_zone_labels(df), df["growth_pct"].tolist(), title, fmt="+.1f")
+            else:
+                df = compute_order_growth_ranking(
+                    orders_df, n=top_n, n_weeks=n_weeks, country=country, ascending=True,
+                    prioritization=prioritization,
+                )
+                if not df.empty:
+                    df = df.sort_values("growth_pct", ascending=False)  # worst decline last → top bar
+                    title = f"Mayor Caída de Órdenes · W-{n_weeks}→W-0{scope}{prio_label}"
+                    return _chart_hbar(_zone_labels(df), df["growth_pct"].tolist(), title, fmt="+.1f")
+
+        # ── Extended ranking (static W-0 snapshot) ────────────────────────────
+        if "ranking" in intent_types and not {"growth_ranking", "decline_ranking"} & set(intent_types):
+            if metric:
+                df = compute_extended_metric_ranking(
+                    metrics_df, metric, n=top_n, country=country, ascending=wants_bottom,
+                    prioritization=prioritization,
+                )
+                if not df.empty and "L0W_ROLL" in df.columns:
+                    # sort so the "most extreme" value is last → appears at top of hbar
+                    df_s = df.sort_values("L0W_ROLL", ascending=not wants_bottom)
+                    direction = "Menor" if wants_bottom else "Mayor"
+                    title = f"{metric} W-0 · {direction}{scope}{prio_label}"
+                    return _chart_hbar(_zone_labels(df_s), df_s["L0W_ROLL"].tolist(), title, fmt=".3f")
+            elif mentions_orders:
+                df = compute_extended_order_ranking(
+                    orders_df, n=top_n, country=country, ascending=wants_bottom,
+                    prioritization=prioritization,
+                )
+                if not df.empty and "L0W" in df.columns:
+                    df_s = df.sort_values("L0W", ascending=not wants_bottom)
+                    direction = "Menor" if wants_bottom else "Mayor"
+                    title = f"Órdenes W-0 · {direction}{scope}{prio_label}"
+                    return _chart_hbar(_zone_labels(df_s), df_s["L0W"].tolist(), title, fmt=",.0f")
+
+    except Exception:
+        pass
+
+    return None
+
+
 def compute_query_analytics(
     metrics_df: pd.DataFrame,
     orders_df: pd.DataFrame,
@@ -511,7 +803,7 @@ def compute_query_analytics(
 ) -> str:
     """
     Route detected intent to computation functions.
-    Returns pre-formatted analytics that the LLM interprets — not recalculates.
+    Returns a pre-formatted RANKING OPERATIVO block for the LLM to present verbatim.
     """
     intent_types = intent.get("intent_types", [])
     # temporal-only is handled by build_entity_context
@@ -521,146 +813,171 @@ def compute_query_analytics(
 
     metric          = intent.get("metric")
     country         = intent.get("country")
+    prioritization  = intent.get("prioritization")
     top_n           = _extract_top_n(question)
     n_weeks         = _extract_n_weeks(question)
     mentions_orders = bool(_ORDERS_RE.search(question))
     wants_bottom    = bool(_BOTTOM_RE.search(question))
+    prio_label      = f" [{prioritization}]" if prioritization else ""
 
-    parts: list[str] = ["", "=== ANALYTICS COMPUTADOS PARA ESTA PREGUNTA ==="]
+    parts: list[str] = ["", "=== RANKING OPERATIVO ==="]
     added = False
 
     # ── Growth ranking ────────────────────────────────────────────────────────
     if "growth_ranking" in intent_types:
         if mentions_orders or metric is None:
             df = compute_order_growth_ranking(
-                orders_df, n=top_n, n_weeks=n_weeks, country=country
+                orders_df, n=top_n, n_weeks=n_weeks, country=country,
+                prioritization=prioritization,
             )
             if not df.empty:
                 scope = f" — {country}" if country else " — Red LATAM"
                 parts.append(
                     f"\nTOP {len(df)} ZONAS: CRECIMIENTO DE ÓRDENES"
-                    f" (W-{n_weeks} → W-0{scope}):"
+                    f" (W-{n_weeks} → W-0{scope}{prio_label}):"
                 )
-                for i, r in enumerate(df.itertuples(), 1):
-                    parts.append(
-                        f"  {i}. {r.ZONE} ({r.CITY}, {r.COUNTRY}):"
-                        f" {r.growth_pct:+.1f}% |"
-                        f" W-{n_weeks}: {int(r.base_orders):,}"
-                        f" → W-0: {int(r.current_orders):,} pedidos"
-                    )
+                rows = [
+                    [i, r.ZONE, r.CITY, r.COUNTRY,
+                     f"{r.growth_pct:+.1f}%",
+                     f"{int(r.base_orders):,}",
+                     f"{int(r.current_orders):,}"]
+                    for i, r in enumerate(df.itertuples(), 1)
+                ]
+                parts += _md_table(
+                    ["#", "Zona", "Ciudad", "País", f"Δ%", f"W-{n_weeks}", "W-0"],
+                    rows,
+                )
                 c_df = compute_country_order_growth(orders_df, n_weeks=n_weeks)
                 if not c_df.empty:
                     parts.append(f"\nCrecimiento de órdenes por país (W-{n_weeks} → W-0):")
-                    for r in c_df.itertuples():
-                        parts.append(
-                            f"  {r.COUNTRY}: {r.growth_pct:+.1f}%"
-                            f" ({int(r.base_orders):,} → {int(r.current_orders):,})"
-                        )
+                    c_rows = [
+                        [r.COUNTRY, f"{r.growth_pct:+.1f}%",
+                         f"{int(r.base_orders):,}", f"{int(r.current_orders):,}"]
+                        for r in c_df.itertuples()
+                    ]
+                    parts += _md_table(["País", "Δ%", f"W-{n_weeks}", "W-0"], c_rows)
                 added = True
 
         if metric:
             df = compute_metric_growth_ranking(
-                metrics_df, metric, n=top_n, n_weeks=n_weeks, country=country
+                metrics_df, metric, n=top_n, n_weeks=n_weeks, country=country,
+                prioritization=prioritization,
             )
             if not df.empty:
                 scope = f" — {country}" if country else " — Red LATAM"
                 parts.append(
                     f"\nTOP {len(df)} ZONAS: CRECIMIENTO DE {metric.upper()}"
-                    f" (W-{n_weeks} → W-0{scope}):"
+                    f" (W-{n_weeks} → W-0{scope}{prio_label}):"
                 )
-                for i, r in enumerate(df.itertuples(), 1):
-                    parts.append(
-                        f"  {i}. {r.ZONE} ({r.CITY}, {r.COUNTRY}):"
-                        f" {r.growth_pct:+.1f}% |"
-                        f" W-{n_weeks}: {r.base_val:.3f} → W-0: {r.current_val:.3f}"
-                    )
+                rows = [
+                    [i, r.ZONE, r.CITY, r.COUNTRY,
+                     f"{r.growth_pct:+.1f}%",
+                     f"{r.base_val:.3f}",
+                     f"{r.current_val:.3f}"]
+                    for i, r in enumerate(df.itertuples(), 1)
+                ]
+                parts += _md_table(
+                    ["#", "Zona", "Ciudad", "País", "Δ%", f"W-{n_weeks}", "W-0"],
+                    rows,
+                )
                 added = True
 
     # ── Decline ranking ───────────────────────────────────────────────────────
     if "decline_ranking" in intent_types:
         if mentions_orders or metric is None:
             df = compute_order_growth_ranking(
-                orders_df, n=top_n, n_weeks=n_weeks, country=country, ascending=True
+                orders_df, n=top_n, n_weeks=n_weeks, country=country, ascending=True,
+                prioritization=prioritization,
             )
             if not df.empty:
                 scope = f" — {country}" if country else " — Red LATAM"
                 parts.append(
                     f"\nTOP {len(df)} ZONAS: MAYOR CAÍDA DE ÓRDENES"
-                    f" (W-{n_weeks} → W-0{scope}):"
+                    f" (W-{n_weeks} → W-0{scope}{prio_label}):"
                 )
-                for i, r in enumerate(df.itertuples(), 1):
-                    parts.append(
-                        f"  {i}. {r.ZONE} ({r.CITY}, {r.COUNTRY}):"
-                        f" {r.growth_pct:+.1f}% |"
-                        f" W-{n_weeks}: {int(r.base_orders):,}"
-                        f" → W-0: {int(r.current_orders):,} pedidos"
-                    )
+                rows = [
+                    [i, r.ZONE, r.CITY, r.COUNTRY,
+                     f"{r.growth_pct:+.1f}%",
+                     f"{int(r.base_orders):,}",
+                     f"{int(r.current_orders):,}"]
+                    for i, r in enumerate(df.itertuples(), 1)
+                ]
+                parts += _md_table(
+                    ["#", "Zona", "Ciudad", "País", "Δ%", f"W-{n_weeks}", "W-0"],
+                    rows,
+                )
                 added = True
 
         if metric:
             df = compute_metric_growth_ranking(
-                metrics_df, metric, n=top_n, n_weeks=n_weeks, country=country, ascending=True
+                metrics_df, metric, n=top_n, n_weeks=n_weeks, country=country, ascending=True,
+                prioritization=prioritization,
             )
             if not df.empty:
                 scope = f" — {country}" if country else " — Red LATAM"
                 parts.append(
                     f"\nTOP {len(df)} ZONAS: MAYOR CAÍDA DE {metric.upper()}"
-                    f" (W-{n_weeks} → W-0{scope}):"
+                    f" (W-{n_weeks} → W-0{scope}{prio_label}):"
                 )
-                for i, r in enumerate(df.itertuples(), 1):
-                    parts.append(
-                        f"  {i}. {r.ZONE} ({r.CITY}, {r.COUNTRY}):"
-                        f" {r.growth_pct:+.1f}% |"
-                        f" W-{n_weeks}: {r.base_val:.3f} → W-0: {r.current_val:.3f}"
-                    )
+                rows = [
+                    [i, r.ZONE, r.CITY, r.COUNTRY,
+                     f"{r.growth_pct:+.1f}%",
+                     f"{r.base_val:.3f}",
+                     f"{r.current_val:.3f}"]
+                    for i, r in enumerate(df.itertuples(), 1)
+                ]
+                parts += _md_table(
+                    ["#", "Zona", "Ciudad", "País", "Δ%", f"W-{n_weeks}", "W-0"],
+                    rows,
+                )
                 added = True
 
     # ── Extended ranking (top/bottom N) ───────────────────────────────────────
     if "ranking" in intent_types and not {"growth_ranking", "decline_ranking"} & set(intent_types):
         if metric:
             df = compute_extended_metric_ranking(
-                metrics_df, metric, n=top_n, country=country, ascending=wants_bottom
+                metrics_df, metric, n=top_n, country=country, ascending=wants_bottom,
+                prioritization=prioritization,
             )
             if not df.empty:
                 scope     = f" — {country}" if country else ""
                 direction = "MENOR" if wants_bottom else "MAYOR"
                 parts.append(
                     f"\nTOP {len(df)} ZONAS POR {metric.upper()}"
-                    f" (W-0, {direction}{scope}):"
+                    f" (W-0, {direction}{scope}{prio_label}):"
                 )
+                rows = []
                 for i, r in enumerate(df.itertuples(), 1):
                     wow_val = getattr(r, "wow_pct", None)
                     wow_str = (
-                        f" | SaS: {wow_val:+.1f}%"
+                        f"{wow_val:+.1f}%"
                         if wow_val is not None and pd.notna(wow_val)
-                        else ""
+                        else "—"
                     )
-                    parts.append(
-                        f"  {i}. {r.ZONE} ({r.CITY}, {r.COUNTRY}):"
-                        f" {r.L0W_ROLL:.3f}{wow_str}"
-                    )
+                    rows.append([i, r.ZONE, r.CITY, r.COUNTRY, f"{r.L0W_ROLL:.3f}", wow_str])
+                parts += _md_table(["#", "Zona", "Ciudad", "País", "W-0", "SaS"], rows)
                 added = True
         elif mentions_orders:
             df = compute_extended_order_ranking(
-                orders_df, n=top_n, country=country, ascending=wants_bottom
+                orders_df, n=top_n, country=country, ascending=wants_bottom,
+                prioritization=prioritization,
             )
             if not df.empty:
                 scope     = f" — {country}" if country else ""
                 direction = "MENOR" if wants_bottom else "MAYOR"
                 parts.append(
-                    f"\nTOP {len(df)} ZONAS POR ÓRDENES (W-0, {direction}{scope}):"
+                    f"\nTOP {len(df)} ZONAS POR ÓRDENES (W-0, {direction}{scope}{prio_label}):"
                 )
+                rows = []
                 for i, r in enumerate(df.itertuples(), 1):
                     wow_val = getattr(r, "wow_pct", None)
                     wow_str = (
-                        f" | SaS: {wow_val:+.1f}%"
+                        f"{wow_val:+.1f}%"
                         if wow_val is not None and pd.notna(wow_val)
-                        else ""
+                        else "—"
                     )
-                    parts.append(
-                        f"  {i}. {r.ZONE} ({r.CITY}, {r.COUNTRY}):"
-                        f" {int(r.L0W):,} pedidos{wow_str}"
-                    )
+                    rows.append([i, r.ZONE, r.CITY, r.COUNTRY, f"{int(r.L0W):,}", wow_str])
+                parts += _md_table(["#", "Zona", "Ciudad", "País", "Pedidos W-0", "SaS"], rows)
                 added = True
 
     # ── Opportunity analysis ──────────────────────────────────────────────────
@@ -674,12 +991,44 @@ def compute_query_analytics(
                 f"\nZONAS DE OPORTUNIDAD — {metric.upper()}"
                 f" (debajo del promedio país{scope}):"
             )
-            for i, r in enumerate(df.itertuples(), 1):
-                parts.append(
-                    f"  {i}. {r.ZONE} ({r.CITY}, {r.COUNTRY}):"
-                    f" {r.L0W_ROLL:.3f} vs promedio {r.COUNTRY} {r.country_avg:.3f}"
-                    f" (brecha: -{r.gap_pct:.1f}%)"
-                )
+            rows = [
+                [i, r.ZONE, r.CITY, r.COUNTRY,
+                 f"{r.L0W_ROLL:.3f}",
+                 f"{r.country_avg:.3f}",
+                 f"-{r.gap_pct:.1f}%"]
+                for i, r in enumerate(df.itertuples(), 1)
+            ]
+            parts += _md_table(
+                ["#", "Zona", "Ciudad", "País", "W-0", "Prom. País", "Brecha"],
+                rows,
+            )
+            added = True
+
+    # ── Zone-type comparison (Wealthy vs Non Wealthy) ─────────────────────────
+    if "zone_type_comparison" in intent_types:
+        _available_metrics = set(metrics_df["METRIC"].dropna().unique())
+        _KEY_ZT_METRICS    = [
+            "Perfect Orders", "Gross Profit UE", "Turbo Adoption", "Lead Penetration",
+        ]
+        _zt_show = [metric] if metric else [
+            m for m in _KEY_ZT_METRICS if m in _available_metrics
+        ]
+        scope = f" — {country}" if country else ""
+        _zt_added = False
+        for _zt_m in _zt_show:
+            df = get_metric_by_zone_type(metrics_df, _zt_m, country=country)
+            if not df.empty:
+                if not _zt_added:
+                    parts.append(f"\nCOMPARACIÓN POR TIPO DE ZONA{scope}:")
+                    _zt_added = True
+                net = metrics_df.loc[metrics_df["METRIC"] == _zt_m, "L0W_ROLL"].mean()
+                parts.append(f"\n  {_zt_m.upper()}:")
+                rows = []
+                for r in df.sort_values("avg_value", ascending=False).itertuples():
+                    gap = (r.avg_value - net) / abs(net) * 100 if net else 0
+                    rows.append([r.ZONE_TYPE, f"{r.avg_value:.3f}", f"{net:.3f}", f"{gap:+.1f}%"])
+                parts += _md_table(["Tipo de Zona", "Promedio", "Red", "Brecha"], rows)
+        if _zt_added:
             added = True
 
     if not added:
@@ -1031,95 +1380,133 @@ def extract_suggested_question(text: str) -> tuple[str, str | None]:
     return text, None
 
 
+_C_RED   = "#FF441F"
+_C_DARK  = "#1C1C28"
+_C_MID   = "#6B7280"
+_C_MUTED = "#9CA3AF"
+_C_GRID  = "rgba(228,232,240,0.55)"
+_C_BAR   = "#D1D5DB"
+_C_FONT  = "Inter, -apple-system, BlinkMacSystemFont, sans-serif"
+
+
+def _ai_layout(title_str: str, height: int, hbar: bool = False) -> dict:
+    """Minimal, premium layout shared across all AI chat charts."""
+    _axis_common = dict(zeroline=False, showline=False, tickfont=dict(size=10, color=_C_MUTED))
+    x_cfg = dict(**_axis_common, showgrid=False)
+    y_cfg = dict(**_axis_common, showgrid=True, gridcolor=_C_GRID, gridwidth=0.5)
+    if hbar:
+        x_cfg, y_cfg = (
+            dict(**_axis_common, showgrid=True, gridcolor=_C_GRID, gridwidth=0.5),
+            dict(**_axis_common, showgrid=False),
+        )
+    return dict(
+        font=dict(family=_C_FONT, size=11, color=_C_MID),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        margin=dict(l=6, r=16, t=34, b=6),
+        height=height,
+        showlegend=False,
+        title=dict(
+            text=title_str,
+            font=dict(size=12, color=_C_DARK, family=_C_FONT),
+            x=0, xanchor="left", pad=dict(l=4, t=0),
+        ),
+        xaxis=x_cfg,
+        yaxis=y_cfg,
+        hoverlabel=dict(
+            bgcolor="white", bordercolor="#E4E8F0",
+            font=dict(size=11, family=_C_FONT),
+        ),
+    )
+
+
+def _chart_hbar(
+    labels: list,
+    values: list,
+    title: str,
+    fmt: str = ".3f",
+) -> go.Figure:
+    """Horizontal bar — top item highlighted red, rest neutral gray."""
+    n = len(labels)
+    colors = [_C_RED if i == n - 1 else _C_BAR for i in range(n)]
+    fig = go.Figure(go.Bar(
+        y=labels,
+        x=values,
+        orientation="h",
+        marker=dict(color=colors, line_width=0),
+        text=[f"{v:{fmt}}" for v in values],
+        textposition="outside",
+        textfont=dict(size=9.5, color=_C_MUTED),
+        hovertemplate="%{y}: %{x}<extra></extra>",
+        cliponaxis=False,
+    ))
+    height = max(180, 28 * n + 40)
+    fig.update_layout(**_ai_layout(title, height=height, hbar=True))
+    fig.update_xaxes(title_text="")
+    fig.update_yaxes(title_text="", ticklabelposition="outside left")
+    return fig
+
+
+def _chart_line(
+    x_vals: list,
+    y_vals: list,
+    title: str,
+) -> go.Figure:
+    """Sparkline-style trend — clean red line, subtle markers, no fill noise."""
+    fig = go.Figure(go.Scatter(
+        x=x_vals, y=y_vals,
+        mode="lines+markers",
+        line=dict(color=_C_RED, width=2, shape="spline", smoothing=0.4),
+        marker=dict(
+            size=5, color=_C_RED,
+            line=dict(color="white", width=1.5),
+        ),
+        hovertemplate="%{x}: %{y:.4f}<extra></extra>",
+    ))
+    fig.update_layout(**_ai_layout(title, height=175))
+    fig.update_xaxes(title_text="")
+    fig.update_yaxes(title_text="", tickformat=".3f")
+    return fig
+
+
 def _render_chart_impl(
     spec: dict,
     metrics_df: pd.DataFrame,
     orders_df: pd.DataFrame,
     fallback_country: str | None = None,
 ) -> go.Figure | None:
-    query      = spec.get("query", "")
-    chart_type = spec.get("chart_type", "bar")
-    title      = spec.get("title", "")
-    metric     = spec.get("metric") or ""
-    raw_c      = spec.get("country")
-    country    = (raw_c if raw_c and raw_c != "null" else None) or fallback_country
-
-    _layout = dict(
-        font_family="Inter, -apple-system, sans-serif",
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        margin=dict(l=16, r=16, t=44, b=16),
-        title_font_size=14,
-        title_font_color="#1C1C28",
-    )
-    _colors = ["#FF441F", "#1C1C28", "#3B82F6", "#10B981", "#F59E0B", "#8B5CF6", "#EC4899", "#06B6D4"]
+    query   = spec.get("query", "")
+    title   = spec.get("title", "")
+    metric  = spec.get("metric") or ""
+    raw_c   = spec.get("country")
+    country = (raw_c if raw_c and raw_c != "null" else None) or fallback_country
 
     try:
         if query == "country_averages" and metric:
-            df = get_country_averages(metrics_df, metric)
-            fig = px.bar(
-                df, x="COUNTRY", y="avg_value", color="COUNTRY",
-                title=title, template="plotly_white",
-                labels={"avg_value": "Valor prom.", "COUNTRY": ""},
-                color_discrete_sequence=_colors,
-            )
-            fig.update_layout(showlegend=False, **_layout)
-            return fig
+            df = get_country_averages(metrics_df, metric).sort_values("avg_value")
+            return _chart_hbar(df["COUNTRY"].tolist(), df["avg_value"].tolist(), title)
 
         if query == "weekly_trend" and metric:
             df = get_weekly_trend(metrics_df, metric, country=country)
-            fig = px.line(
-                df, x="week", y="value", markers=True,
-                title=title, template="plotly_white",
-                labels={"value": "Valor prom.", "week": ""},
-                color_discrete_sequence=_colors,
-            )
-            fig.update_traces(line_width=2.5, marker_size=7)
-            fig.update_layout(**_layout)
-            return fig
+            return _chart_line(df["week"].tolist(), df["value"].tolist(), title)
 
         if query == "top_zones" and metric:
-            df = get_top_zones(metrics_df, metric, country=country, n=10)
+            df = get_top_zones(metrics_df, metric, country=country, n=8)
             if "L0W_ROLL" in df.columns:
-                color_col = "ZONE_TYPE" if "ZONE_TYPE" in df.columns else None
-                fig = px.bar(
-                    df, x="ZONE", y="L0W_ROLL", color=color_col,
-                    title=title, template="plotly_white",
-                    labels={"L0W_ROLL": "Valor", "ZONE": ""},
-                    color_discrete_sequence=_colors,
-                )
-                fig.update_layout(xaxis_tickangle=-40, **_layout)
-                return fig
+                df = df.sort_values("L0W_ROLL")
+                labels = [z[:28] + "…" if len(z) > 28 else z for z in df["ZONE"].tolist()]
+                return _chart_hbar(labels, df["L0W_ROLL"].tolist(), title)
 
         if query == "orders_by_country":
-            df = get_orders_by_country(orders_df)
-            if chart_type == "pie":
-                fig = px.pie(
-                    df, names="COUNTRY", values="total_orders",
-                    title=title, template="plotly_white", hole=0.42,
-                    color_discrete_sequence=_colors,
-                )
-                fig.update_layout(**_layout)
-                return fig
-            fig = px.bar(
-                df, x="COUNTRY", y="total_orders", color="COUNTRY",
-                title=title, template="plotly_white",
-                labels={"total_orders": "Pedidos", "COUNTRY": ""},
-                color_discrete_sequence=_colors,
+            df = get_orders_by_country(orders_df).sort_values("total_orders")
+            return _chart_hbar(
+                df["COUNTRY"].tolist(), df["total_orders"].tolist(), title, fmt=",.0f"
             )
-            fig.update_layout(showlegend=False, **_layout)
-            return fig
 
         if query == "orders_trend":
             df = get_orders_trend(orders_df, country=country)
-            fig = px.line(
-                df, x="week", y="orders", markers=True,
-                title=title, template="plotly_white",
-                labels={"orders": "Total pedidos", "week": ""},
-                color_discrete_sequence=_colors,
-            )
-            fig.update_traces(line_width=2.5, marker_size=7)
-            fig.update_layout(**_layout)
+            fig = _chart_line(df["week"].tolist(), df["orders"].tolist(), title)
+            fig.update_yaxes(tickformat=",.0f")
             return fig
 
         if query == "zone_trend" and metric:
@@ -1131,25 +1518,14 @@ def _render_chart_impl(
                 )
             sub = metrics_df[mask & (metrics_df["METRIC"] == metric)]
             if not sub.empty:
-                row   = sub.iloc[0]
-                weeks = []
-                vals  = []
+                row = sub.iloc[0]
+                weeks, vals = [], []
                 for col, lbl in zip(WEEK_COLS_METRICS, WEEK_LABELS):
                     if col in row.index and pd.notna(row[col]):
                         weeks.append(lbl)
                         vals.append(float(row[col]))
                 if weeks:
-                    plot_df = pd.DataFrame({"week": weeks, "value": vals})
-                    fig = px.line(
-                        plot_df, x="week", y="value", markers=True,
-                        title=title or f"{metric} — {row['ZONE']}",
-                        template="plotly_white",
-                        labels={"value": "Valor", "week": ""},
-                        color_discrete_sequence=_colors,
-                    )
-                    fig.update_traces(line_width=2.5, marker_size=8)
-                    fig.update_layout(**_layout)
-                    return fig
+                    return _chart_line(weeks, vals, title or f"{metric} · {row['ZONE']}")
 
         if query == "city_trend" and metric:
             city_name = spec.get("city", "")
@@ -1160,8 +1536,7 @@ def _render_chart_impl(
                 )
             sub = metrics_df[mask & (metrics_df["METRIC"] == metric)]
             if not sub.empty:
-                weeks = []
-                vals  = []
+                weeks, vals = [], []
                 for col, lbl in zip(WEEK_COLS_METRICS, WEEK_LABELS):
                     if col in sub.columns:
                         avg = sub[col].mean()
@@ -1169,18 +1544,23 @@ def _render_chart_impl(
                             weeks.append(lbl)
                             vals.append(float(avg))
                 if weeks:
-                    city_label = sub["CITY"].iloc[0]
-                    plot_df = pd.DataFrame({"week": weeks, "value": vals})
-                    fig = px.line(
-                        plot_df, x="week", y="value", markers=True,
-                        title=title or f"{metric} — {city_label}",
-                        template="plotly_white",
-                        labels={"value": "Valor prom.", "week": ""},
-                        color_discrete_sequence=_colors,
-                    )
-                    fig.update_traces(line_width=2.5, marker_size=8)
-                    fig.update_layout(**_layout)
-                    return fig
+                    return _chart_line(weeks, vals, title or f"{metric} · {sub['CITY'].iloc[0]}")
+
+        if query == "wow_ranking" and metric:
+            df = get_wow_zones(metrics_df, metric, country=country, n=8, ascending=True)
+            if not df.empty and "wow_pct" in df.columns:
+                df_sorted = df.sort_values("wow_pct", ascending=False)
+                labels = [
+                    f"{z[:20]}… ({c})" if len(z) > 20 else f"{z} ({c})"
+                    for z, c in zip(df_sorted["ZONE"].tolist(), df_sorted["COUNTRY"].tolist())
+                ]
+                return _chart_hbar(labels, df_sorted["wow_pct"].tolist(), title, fmt="+.1f")
+
+        if query == "zone_type_comparison" and metric:
+            df = get_metric_by_zone_type(metrics_df, metric, country=country)
+            if not df.empty:
+                df = df.sort_values("avg_value")
+                return _chart_hbar(df["ZONE_TYPE"].tolist(), df["avg_value"].tolist(), title)
 
     except Exception:
         pass
@@ -1195,10 +1575,17 @@ def render_chart_from_spec(
     fallback_country: str | None = None,
     compact: bool = False,
 ) -> go.Figure | None:
-    """Public wrapper — delegates to _render_chart_impl and applies compact sizing."""
+    """Public wrapper — builds chart and optionally tightens for inline chat use."""
     fig = _render_chart_impl(spec, metrics_df, orders_df, fallback_country)
     if fig is not None and compact:
-        fig.update_layout(height=260, margin=dict(l=12, r=12, t=36, b=10))
+        cur = fig.layout.height or 200
+        # Bar charts need more vertical space; line/small charts can stay compact
+        cap = 280 if cur > 220 else 195
+        fig.update_layout(
+            height=min(cur, cap),
+            margin=dict(l=4, r=12, t=28, b=4),
+            title=dict(font=dict(size=11)),
+        )
     return fig
 
 

@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from src.insights import SEVERITY_CONFIG, SEVERITY_ORDER
+from src.insights import SEVERITY_CONFIG, SEVERITY_ORDER, CATEGORY_CONFIG
 
 # ── Brand palette (mirrors app.py constants) ──────────────────────────────────
 _RED    = "#FF441F"
@@ -32,10 +32,14 @@ def _e(v) -> str:
 # ── HTML helpers ──────────────────────────────────────────────────────────────
 
 def _insight_card(ins: dict) -> str:
-    cfg   = SEVERITY_CONFIG[ins["severity"]]
-    color = cfg["color"]
-    label = cfg["label"]
-    delta = ins["delta_pct"]
+    sev_cfg = SEVERITY_CONFIG[ins["severity"]]
+    cat_cfg = CATEGORY_CONFIG.get(ins.get("category", "anomaly"), {})
+    color   = sev_cfg["color"]
+    label   = sev_cfg["label"]
+    cat_lbl = cat_cfg.get("emoji", "") + " " + cat_cfg.get("label", "")
+    cat_col = cat_cfg.get("color", "#6B7280")
+    delta   = ins["delta_pct"]
+    score   = ins.get("score", 0)
     delta_color = _GREEN if delta > 0 else _DANGER
     delta_str   = f"{delta:+.1f}%"
     return f"""
@@ -44,8 +48,12 @@ def _insight_card(ins: dict) -> str:
       <div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:7px;">
         <span style="background:{color};color:white;font-size:9.5px;font-weight:700;
                      letter-spacing:.5px;padding:3px 9px;border-radius:100px;">{_e(label)}</span>
+        <span style="background:{cat_col}18;color:{cat_col};font-size:9.5px;font-weight:700;
+                     letter-spacing:.4px;padding:3px 9px;border-radius:100px;">{_e(cat_lbl)}</span>
         <span style="background:#F1F3F9;color:{delta_color};font-size:10px;font-weight:700;
                      padding:3px 9px;border-radius:100px;">{_e(delta_str)}</span>
+        <span style="background:#F8F9FB;color:#9CA3AF;font-size:9.5px;font-weight:600;
+                     padding:3px 9px;border-radius:100px;">Score: {score:.0f}</span>
         <span style="font-weight:700;font-size:13.5px;color:{_DARK};">{_e(ins['title'])}</span>
       </div>
       <p style="margin:4px 0;font-size:13px;color:{_DARK};">
@@ -165,15 +173,14 @@ def generate_html_report(
     now   = datetime.now().strftime("%d %b %Y, %H:%M")
     scope = country if country else "LATAM — 9 paises"
 
-    ordered   = sorted(insights, key=lambda x: SEVERITY_ORDER.get(x["severity"], 9))
+    ordered   = sorted(insights, key=lambda x: (SEVERITY_ORDER.get(x["severity"], 9), -x.get("score", 0)))
     critical  = [i for i in ordered if i["severity"] == "critical"]
     warnings  = [i for i in ordered if i["severity"] == "warning"]
     opps      = [i for i in ordered if i["severity"] == "opportunity"]
     positives = [i for i in ordered if i["severity"] == "positive"]
-    trend_insights = [
-        i for i in ordered
-        if "tendencia" in i.get("title", "").lower() or "recuperacion" in i.get("title", "").lower()
-    ]
+
+    # Category groups — used for structured sections
+    by_cat = {cat: [i for i in ordered if i.get("category") == cat] for cat in CATEGORY_CONFIG}
 
     top_findings = (critical + warnings)[:5]
 
@@ -305,9 +312,23 @@ def generate_html_report(
   {findings_html}
 </div>
 
-{_section("Alertas Criticas", "🔴", "#FFF5F5", critical)}
-{_section("Alertas de Atencion", "🟠", "#FFFBEB", warnings)}
-{_section("Tendencias Preocupantes (3+ semanas)", "📉", "#FFF8E1", trend_insights) if trend_insights else ""}
+<!-- ── Category bar ── -->
+<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:20px;">
+  {''.join([
+    f'<div style="background:{cfg["color"]}12;border:1.5px solid {cfg["color"]}30;'
+    f'border-radius:10px;padding:10px 12px;text-align:center;">'
+    f'<div style="font-size:20px;font-weight:800;color:{cfg["color"]};">'
+    f'{len(by_cat[cat])}</div>'
+    f'<div style="font-size:9.5px;font-weight:700;color:{cfg["color"]};'
+    f'letter-spacing:.5px;text-transform:uppercase;margin-top:2px;">'
+    f'{cfg["emoji"]} {cfg["label"]}</div></div>'
+    for cat, cfg in CATEGORY_CONFIG.items()
+  ])}
+</div>
+
+{_section("🔺 Anomalías", "🔺", "#FFF5F5", by_cat["anomaly"])}
+{_section("📉 Tendencias Preocupantes", "📉", "#FFFBEB", by_cat["trend"])}
+{_section("🌎 Benchmarking", "🌎", "#EFF6FF", by_cat["benchmark"])}
 
 <!-- ── Benchmark de paises ── -->
 <div style="background:{_CARD};border:1.5px solid {_BORDER};border-radius:14px;
@@ -323,8 +344,9 @@ def generate_html_report(
   {_benchmark_table(avg_df)}
 </div>
 
-{_section("Oportunidades Identificadas", "🔵", "#EFF6FF", opps)}
-{_section("Senales Positivas", "🟢", "#F0FDF4", positives)}
+{_section("🔗 Correlaciones", "🔗", "#F5F3FF", by_cat["correlation"])}
+{_section("💡 Oportunidades", "💡", "#F0FDF4", by_cat["opportunity"])}
+{_section("🟢 Mejoras y Recuperaciones", "🟢", "#F0FDF4", positives)}
 
 <!-- ── Recommendations ── -->
 <div style="background:{_CARD};border:1.5px solid {_BORDER};border-radius:14px;
@@ -380,11 +402,12 @@ def generate_markdown_report(
     now   = datetime.now().strftime("%d %b %Y, %H:%M")
     scope = country if country else "LATAM — 9 paises"
 
-    ordered   = sorted(insights, key=lambda x: SEVERITY_ORDER.get(x["severity"], 9))
+    ordered   = sorted(insights, key=lambda x: (SEVERITY_ORDER.get(x["severity"], 9), -x.get("score", 0)))
     critical  = [i for i in ordered if i["severity"] == "critical"]
     warnings  = [i for i in ordered if i["severity"] == "warning"]
     opps      = [i for i in ordered if i["severity"] == "opportunity"]
     positives = [i for i in ordered if i["severity"] == "positive"]
+    by_cat    = {cat: [i for i in ordered if i.get("category") == cat] for cat in CATEGORY_CONFIG}
 
     lines: list[str] = [
         f"# Informe Ejecutivo de Operaciones — {metric}",
@@ -407,39 +430,49 @@ def generate_markdown_report(
         "",
     ]
 
-    if critical:
-        lines += ["## 🔴 Alertas Criticas", ""]
-        for ins in critical:
-            lines += _md_insight(ins)
-
-    if warnings:
-        lines += ["## 🟠 Alertas de Atencion", ""]
-        for ins in warnings:
-            lines += _md_insight(ins)
-
-    trend_ins = [
-        i for i in ordered
-        if "tendencia" in i.get("title", "").lower() or "recuperacion" in i.get("title", "").lower()
+    # Category summary table
+    lines += [
+        "## Cobertura por Categoría", "",
+        "| Categoría | Insights | Descripción |",
+        "|-----------|----------|-------------|",
     ]
-    if trend_ins:
-        lines += ["## 📉 Tendencias Preocupantes (3+ semanas)", ""]
-        for ins in trend_ins:
-            lines += _md_insight(ins)
+    _CAT_DESC = {
+        "anomaly":     "Cambios WoW drásticos (>10%)",
+        "trend":       "Deterioro/mejora 3+ semanas consecutivas",
+        "benchmark":   "Comparación zona/país vs pares del segmento",
+        "correlation": "Relaciones entre métricas operativas",
+        "opportunity": "Zonas con potencial de mejora significativo",
+    }
+    for cat, cfg in CATEGORY_CONFIG.items():
+        n = len(by_cat[cat])
+        lines.append(f"| {cfg['emoji']} {cfg['label']} | **{n}** | {_CAT_DESC.get(cat, '')} |")
+    lines.append("")
 
-    # Country benchmark
+    # Sections by category
+    _CAT_HEADERS = {
+        "anomaly":     "## 🔺 Anomalías (Cambios WoW Drásticos)",
+        "trend":       "## 📉 Tendencias Preocupantes (3+ Semanas)",
+        "benchmark":   "## 🌎 Benchmarking (Comparación entre Pares)",
+        "correlation": "## 🔗 Correlaciones entre Métricas",
+        "opportunity": "## 💡 Oportunidades Operativas",
+    }
+    for cat, header in _CAT_HEADERS.items():
+        cat_ins = by_cat[cat]
+        if cat_ins:
+            lines += [header, ""]
+            for ins in cat_ins:
+                lines += _md_insight(ins)
+
+    # Country benchmark table
     if not avg_df.empty:
-        lines += ["## 🌎 Benchmark de Paises", "", f"| Pais | {metric} (W-0) |", "|------|---------|"]
+        lines += ["## 🌎 Benchmark de Países — Tabla Comparativa", "",
+                  f"| País | {metric} (W-0) |", "|------|---------|"]
         for _, row in avg_df.iterrows():
             lines.append(f"| {row['COUNTRY']} | {row['avg_value']:.3f} |")
         lines.append("")
 
-    if opps:
-        lines += ["## 🔵 Oportunidades Identificadas", ""]
-        for ins in opps:
-            lines += _md_insight(ins)
-
     if positives:
-        lines += ["## 🟢 Senales Positivas", ""]
+        lines += ["## 🟢 Señales Positivas y Recuperaciones", ""]
         for ins in positives:
             lines += _md_insight(ins)
 
@@ -469,6 +502,319 @@ def generate_markdown_report(
     ]
 
     return "\n".join(lines)
+
+
+# ── CSV insights export ───────────────────────────────────────────────────────
+
+def generate_insights_csv(insights: list[dict]) -> str:
+    """Return a UTF-8 CSV string with all insight fields, ready for Excel/Sheets."""
+    _COLS = [
+        "severity", "category", "score",
+        "country", "city", "zone",
+        "metric", "value", "delta_pct",
+        "title", "finding", "explanation", "action",
+    ]
+    df = pd.DataFrame(insights)
+    if df.empty:
+        return ",".join(_COLS) + "\n"
+    out_cols = [c for c in _COLS if c in df.columns]
+    return df[out_cols].to_csv(index=False)
+
+
+# ── PDF report ─────────────────────────────────────────────────────────────────
+
+def generate_pdf_report(
+    insights: list[dict],
+    summary: dict,
+    metric: str,
+    country: str | None,
+    avg_df: pd.DataFrame,
+) -> bytes:
+    """Return a self-contained A4 PDF as bytes. Requires fpdf2>=2.7.0."""
+    try:
+        from fpdf import FPDF
+    except ImportError as exc:
+        raise ImportError("fpdf2 is required for PDF export: pip install fpdf2") from exc
+
+    def _s(v: object, maxlen: int = 0) -> str:
+        """Encode to Latin-1 for fpdf2 core fonts; replace unmappable chars."""
+        s = str(v).encode("latin-1", errors="replace").decode("latin-1")
+        return s[:maxlen] if maxlen else s
+
+    now   = datetime.now().strftime("%d %b %Y, %H:%M")
+    scope = country if country else "LATAM"
+
+    ordered   = sorted(insights, key=lambda x: (SEVERITY_ORDER.get(x["severity"], 9), -x.get("score", 0)))
+    critical  = [i for i in ordered if i["severity"] == "critical"]
+    warnings  = [i for i in ordered if i["severity"] == "warning"]
+    opps      = [i for i in ordered if i["severity"] == "opportunity"]
+    pos       = [i for i in ordered if i["severity"] == "positive"]
+
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.add_page()
+    pdf.set_margins(14, 14, 14)
+    W = 182  # usable width: 210 - 2*14
+
+    # ── Header band ──────────────────────────────────────────────────────────
+    pdf.set_fill_color(28, 28, 40)
+    pdf.rect(0, 0, 210, 30, "F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.set_xy(14, 6)
+    pdf.cell(W, 7, "rappi  Operations Analytics", ln=False)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_xy(14, 15)
+    pdf.cell(W, 5, _s(f"Informe Ejecutivo  .  {scope}  .  {now}"), ln=False)
+    pdf.set_text_color(255, 100, 60)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_xy(14, 22)
+    pdf.cell(W, 5, _s(f"Metrica principal: {metric}"), ln=False)
+    pdf.set_text_color(28, 28, 40)
+    pdf.set_y(36)
+
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    kpis = [
+        ("TOTAL PEDIDOS",    f"{summary['total_orders']:,}",  f"{summary['orders_wow_pct']:+.1f}% SaS"),
+        ("ALERTAS CRITICAS", str(len(critical)),              f"{len(warnings)} alertas adicionales"),
+        ("OPORTUNIDADES",    str(len(opps)),                  "zonas con potencial"),
+        ("MEJORAS",          str(len(pos)),                   "senales positivas"),
+    ]
+    kpi_w = (W - 6) / 4  # 4 cards, 2mm gap between each
+    pdf.set_draw_color(228, 232, 240)
+    for i, (lbl, val, sub) in enumerate(kpis):
+        xk = 14 + i * (kpi_w + 2)
+        pdf.set_fill_color(255, 255, 255)
+        pdf.rect(xk, 36, kpi_w, 20, "FD")
+        pdf.set_font("Helvetica", "B", 6)
+        pdf.set_text_color(156, 163, 175)
+        pdf.set_xy(xk + 2, 38.5)
+        pdf.cell(kpi_w - 4, 3.5, lbl, ln=True)
+        r, g, b = (239, 68, 68) if (lbl == "ALERTAS CRITICAS" and len(critical) > 0) else (28, 28, 40)
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(r, g, b)
+        pdf.set_xy(xk + 2, 42.5)
+        pdf.cell(kpi_w - 4, 7, val, ln=True)
+        pdf.set_font("Helvetica", "", 6)
+        pdf.set_text_color(156, 163, 175)
+        pdf.set_xy(xk + 2, 51)
+        pdf.cell(kpi_w - 4, 3.5, _s(sub), ln=True)
+
+    pdf.set_y(62)
+
+    # ── Insights table ────────────────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(28, 28, 40)
+    pdf.cell(W, 5, f"Insights Operativos  ({len(ordered)} detectados)", ln=True)
+    pdf.ln(1.5)
+
+    _SEV_LABEL = {"critical": "CRITICA", "warning": "ALERTA", "opportunity": "OPORT.", "positive": "MEJORA"}
+    _SEV_RGB   = {
+        "critical":    (239,  68,  68),
+        "warning":     (245, 158,  11),
+        "opportunity": ( 59, 130, 246),
+        "positive":    ( 16, 185, 129),
+    }
+    # column (label, width)
+    _ICOLS = [("SEV", 15), ("METRICA", 43), ("ZONA", 49), ("PAIS", 12),
+              ("VALOR", 18), ("SaS%", 16), ("SCORE", 14), ("CAT", 15)]
+    # assert sum(w for _, w in _ICOLS) == 182
+
+    pdf.set_fill_color(248, 249, 251)
+    pdf.set_draw_color(228, 232, 240)
+    pdf.set_font("Helvetica", "B", 6)
+    pdf.set_text_color(156, 163, 175)
+    for lbl, w in _ICOLS:
+        pdf.cell(w, 4, lbl, border=1, align="C", fill=True)
+    pdf.ln()
+
+    pdf.set_font("Helvetica", "", 6.5)
+    for ins in ordered:
+        sev = ins.get("severity", "warning")
+        r, g, b = _SEV_RGB.get(sev, (107, 114, 128))
+        delta = ins.get("delta_pct", 0)
+        val   = ins.get("value", 0)
+        cat_label = CATEGORY_CONFIG.get(ins.get("category", "anomaly"), {}).get("label", "")
+
+        pdf.set_fill_color(r, g, b)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(15, 3.5, _SEV_LABEL.get(sev, ""), border=1, align="C", fill=True)
+
+        pdf.set_fill_color(255, 255, 255)
+        pdf.set_text_color(28, 28, 40)
+        pdf.cell(43, 3.5, _s(ins.get("metric", ""), 23), border=1)
+        pdf.cell(49, 3.5, _s(ins.get("zone",   ""), 27), border=1)
+        pdf.cell(12, 3.5, _s(ins.get("country",""),  4), border=1, align="C")
+        pdf.cell(18, 3.5, f"{val:.3f}",                 border=1, align="R")
+        dr, dg, db = (16, 185, 129) if delta >= 0 else (239, 68, 68)
+        pdf.set_text_color(dr, dg, db)
+        pdf.cell(16, 3.5, f"{delta:+.1f}%", border=1, align="R")
+        pdf.set_text_color(107, 114, 128)
+        pdf.cell(14, 3.5, f"{ins.get('score', 0):.0f}", border=1, align="R")
+        pdf.cell(15, 3.5, _s(cat_label, 10), border=1)
+        pdf.set_text_color(28, 28, 40)
+        pdf.ln()
+
+    # ── Country benchmark ─────────────────────────────────────────────────────
+    if not avg_df.empty:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(28, 28, 40)
+        pdf.cell(W, 5, _s(f"Benchmark de Paises  —  {metric}"), ln=True)
+        pdf.ln(1.5)
+
+        net_avg = avg_df["avg_value"].mean()
+        _BCOLS  = [("PAIS", 30), ("VALOR W-0", 55), ("DELTA VS RED", 47), ("POSICION", 50)]
+        pdf.set_fill_color(248, 249, 251)
+        pdf.set_draw_color(228, 232, 240)
+        pdf.set_font("Helvetica", "B", 7)
+        pdf.set_text_color(156, 163, 175)
+        for hdr, w in _BCOLS:
+            pdf.cell(w, 4.5, hdr, border=1, align="C", fill=True)
+        pdf.ln()
+
+        pdf.set_font("Helvetica", "", 8)
+        for pos_i, (_, row) in enumerate(avg_df.iterrows(), 1):
+            badge   = "LIDER" if pos_i == 1 else ("REZAGADO" if pos_i == len(avg_df) else "")
+            gap_pct = (row["avg_value"] - net_avg) / abs(net_avg) * 100 if net_avg else 0
+            vr, vg, vb = (16, 185, 129) if row["avg_value"] >= net_avg else (239, 68, 68)
+            pdf.set_text_color(28, 28, 40)
+            pdf.cell(30, 4.5, _s(row["COUNTRY"]), border=1, align="C")
+            pdf.set_text_color(vr, vg, vb)
+            pdf.cell(55, 4.5, f"{row['avg_value']:.4f}", border=1, align="R")
+            pdf.cell(47, 4.5, f"{gap_pct:+.1f}%",        border=1, align="R")
+            pdf.set_text_color(107, 114, 128)
+            pdf.cell(50, 4.5, badge, border=1, align="C")
+            pdf.set_text_color(28, 28, 40)
+            pdf.ln()
+
+    # ── Recommendations ───────────────────────────────────────────────────────
+    seen: set[str] = set()
+    recs: list[str] = []
+    for ins in critical + warnings + opps:
+        a = ins.get("action", "").strip()
+        if a and a not in seen:
+            seen.add(a)
+            recs.append(a)
+        if len(recs) >= 6:
+            break
+
+    if recs:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(28, 28, 40)
+        pdf.cell(W, 5, "Acciones Recomendadas", ln=True)
+        pdf.ln(1.5)
+        for i, rec in enumerate(recs, 1):
+            pdf.set_font("Helvetica", "", 8)
+            pdf.set_text_color(28, 28, 40)
+            pdf.multi_cell(W, 5, _s(f"{i}. {rec}", 220))
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    pdf.set_y(-13)
+    pdf.set_draw_color(228, 232, 240)
+    pdf.line(14, pdf.get_y(), 196, pdf.get_y())
+    pdf.ln(1.5)
+    pdf.set_font("Helvetica", "", 6.5)
+    pdf.set_text_color(156, 163, 175)
+    pdf.cell(W, 4, _s(f"Rappi Operations Analytics  .  {now}  .  Uso exclusivo interno Rappi"), align="C")
+
+    return bytes(pdf.output())
+
+
+# ── Chat transcript exports ───────────────────────────────────────────────────
+
+def generate_chat_csv(messages: list[dict]) -> str:
+    """Return a UTF-8 CSV transcript of a Copiloto IA conversation."""
+    rows = []
+    turn = 1
+    for m in messages:
+        role = m.get("role", "")
+        if role not in ("user", "assistant"):
+            continue
+        rows.append({
+            "turno":     turn,
+            "rol":       "Usuario" if role == "user" else "Copiloto IA",
+            "contenido": m.get("content", ""),
+        })
+        if role == "assistant":
+            turn += 1
+    if not rows:
+        return "turno,rol,contenido\n"
+    return pd.DataFrame(rows).to_csv(index=False)
+
+
+def generate_chat_pdf(messages: list[dict]) -> bytes:
+    """Return an A4 PDF transcript of a Copiloto IA conversation. Requires fpdf2."""
+    try:
+        from fpdf import FPDF
+    except ImportError as exc:
+        raise ImportError("fpdf2 is required: pip install fpdf2") from exc
+
+    def _s(v: object, maxlen: int = 0) -> str:
+        s = str(v).encode("latin-1", errors="replace").decode("latin-1")
+        return s[:maxlen] if maxlen else s
+
+    now = datetime.now().strftime("%d %b %Y, %H:%M")
+
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.add_page()
+    pdf.set_margins(14, 14, 14)
+    W = 182
+
+    # Header band
+    pdf.set_fill_color(28, 28, 40)
+    pdf.rect(0, 0, 210, 28, "F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_xy(14, 6)
+    pdf.cell(W, 7, "rappi  Copiloto IA", ln=False)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_xy(14, 15)
+    pdf.cell(W, 5, _s(f"Transcripcion de sesion  .  {now}"), ln=False)
+    pdf.set_text_color(28, 28, 40)
+    pdf.set_y(36)
+
+    turn = 1
+    for m in messages:
+        role    = m.get("role", "")
+        content = m.get("content", "")
+        if role not in ("user", "assistant"):
+            continue
+
+        if role == "user":
+            pdf.set_font("Helvetica", "B", 7)
+            pdf.set_text_color(255, 68, 31)
+            pdf.cell(W, 4, "TU", align="R", ln=True)
+            pdf.set_font("Helvetica", "", 8.5)
+            pdf.set_text_color(28, 28, 40)
+            pdf.set_fill_color(255, 244, 242)
+            pdf.set_draw_color(255, 210, 200)
+            pdf.multi_cell(W, 5, _s(content), border=1, fill=True)
+            pdf.ln(2)
+        else:
+            pdf.set_font("Helvetica", "B", 7)
+            pdf.set_text_color(107, 114, 128)
+            pdf.cell(W, 4, _s(f"COPILOTO IA  .  Respuesta {turn}"), ln=True)
+            turn += 1
+            pdf.set_font("Helvetica", "", 8.5)
+            pdf.set_text_color(28, 28, 40)
+            pdf.set_fill_color(248, 249, 251)
+            pdf.set_draw_color(228, 232, 240)
+            pdf.multi_cell(W, 5, _s(content), border=1, fill=True)
+            pdf.ln(4)
+
+    # Footer
+    pdf.set_y(-13)
+    pdf.set_draw_color(228, 232, 240)
+    pdf.line(14, pdf.get_y(), 196, pdf.get_y())
+    pdf.ln(1.5)
+    pdf.set_font("Helvetica", "", 6.5)
+    pdf.set_text_color(156, 163, 175)
+    pdf.cell(W, 4, _s(f"Rappi Operations Analytics  .  {now}  .  Uso exclusivo interno Rappi"), align="C")
+
+    return bytes(pdf.output())
 
 
 # ── Email body helper ──────────────────────────────────────────────────────────

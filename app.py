@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 
@@ -26,11 +27,17 @@ from src.data_loader import (
     get_dataset_summary,
     get_wow_zones,
 )
-from src.insights import generate_insights, count_by_severity, SEVERITY_CONFIG
+from src.insights import (
+    generate_insights, prioritize_insights,
+    count_by_severity, count_by_category,
+    SEVERITY_CONFIG, CATEGORY_CONFIG,
+)
 from src.chat import (
     build_analytics_context,
     build_dynamic_context,
     build_full_context,
+    compute_intent_chart,
+    detect_question_intent,
     extract_suggested_question,
     load_system_prompt,
     parse_chart_spec,
@@ -40,14 +47,18 @@ from src.chat import (
 )
 from src.providers import get_provider
 from src.providers.base import AuthError, NetworkError, ProviderError, RateLimitError
-from src.report import generate_html_report, generate_markdown_report, build_email_body
+from src.report import (
+    generate_html_report, generate_markdown_report, build_email_body,
+    generate_pdf_report, generate_insights_csv,
+    generate_chat_csv, generate_chat_pdf,
+)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Rappi Operations Analytics",
     page_icon="🛵",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ── Design system ─────────────────────────────────────────────────────────────
@@ -64,6 +75,9 @@ RED_ALERT   = "#EF4444"
 BLUE        = "#3B82F6"
 CHART_COLORS = [RAPPI_RED, DARK_NAV, BLUE, GREEN, AMBER, "#8B5CF6", "#EC4899", "#06B6D4"]
 
+# HTML-escape helper — prevents XSS from raw zone/metric names in HTML cards
+_H = lambda s: str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
@@ -72,10 +86,33 @@ html, body, [class*="css"], .stApp {{
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
 }}
 
+/* ── Fixed-height SPA shell ────────────────────────────────────────────────────
+   html/body/stApp are locked at 100dvh — the document never page-scrolls.
+   stMain gets an explicit height so it never grows beyond the viewport.
+   Scroll is handled per page:
+     • Insights / content pages  →  stMain overridden to overflow-y:auto (page CSS)
+     • Copiloto                  →  stMain stays hidden; st.container(540) scrolls */
+html, body {{
+    height: 100% !important;
+    overflow: hidden !important;
+}}
+[data-testid="stApp"] {{
+    height: 100dvh !important;
+    overflow: hidden !important;
+}}
+[data-testid="stMain"] {{
+    overflow: hidden !important;
+    height: 100dvh !important;
+}}
+
 /* ── Layout ── */
 .main .block-container {{
-    padding: 0.5rem 2rem 3rem 2rem !important;
+    padding: 0.5rem 2rem 1rem 2rem !important;
     max-width: 1480px !important;
+    height: 100dvh !important;
+    box-sizing: border-box !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
 }}
 
 /* ── KPI metric cards ── */
@@ -104,43 +141,49 @@ html, body, [class*="css"], .stApp {{
     font-weight: 600 !important;
 }}
 
-/* ── Tab navigation (pill style) ── */
-.stTabs [data-baseweb="tab-list"] {{
-    background: #ECEEF5;
-    border-radius: 12px;
-    padding: 5px 5px;
-    gap: 2px;
-    border-bottom: none !important;
-    box-shadow: none !important;
-}}
-.stTabs [data-baseweb="tab"] {{
-    background: transparent !important;
-    border: none !important;
-    border-radius: 9px !important;
-    font-size: 12px !important;
-    font-weight: 500 !important;
-    color: {TEXT_SEC} !important;
-    padding: 7px 15px !important;
-    transition: all 0.15s !important;
-}}
-.stTabs [aria-selected="true"][data-baseweb="tab"] {{
-    background: {CARD_BG} !important;
-    color: {TEXT_PRI} !important;
-    box-shadow: 0 1px 5px rgba(28,28,40,0.13) !important;
-}}
-/* ── Copiloto IA tab (first) — RAPPI RED brand ── */
-.stTabs [data-baseweb="tab"]:first-child {{
-    color: {RAPPI_RED} !important;
-    font-weight: 700 !important;
-    font-size: 12.5px !important;
-}}
-.stTabs [data-baseweb="tab"]:first-child[aria-selected="true"] {{
+/* ── Sidebar nav buttons — layout & sizing ── */
+section[data-testid="stSidebar"] [data-testid="baseButton-primary"] {{
     background: {RAPPI_RED} !important;
-    color: #FFFFFF !important;
-    box-shadow: 0 2px 8px rgba(255,68,31,0.28) !important;
+    background-color: {RAPPI_RED} !important;
+    border: none !important;
+    box-shadow: 0 2px 10px rgba(255,68,31,0.35) !important;
+    font-weight: 600 !important;
+    font-size: 12.5px !important;
+    border-radius: 6px !important;
+    text-align: left !important;
+    justify-content: flex-start !important;
+    padding: 6px 12px !important;
+    min-height: 30px !important;
+    height: auto !important;
+    opacity: 1 !important;
+    filter: none !important;
 }}
-.stTabs [data-baseweb="tab-highlight"] {{ display: none !important; }}
-.stTabs [data-baseweb="tab-border"] {{ display: none !important; }}
+section[data-testid="stSidebar"] [data-testid="baseButton-secondary"] {{
+    background: transparent !important;
+    background-color: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    font-weight: 500 !important;
+    font-size: 12.5px !important;
+    border-radius: 6px !important;
+    text-align: left !important;
+    justify-content: flex-start !important;
+    padding: 6px 12px !important;
+    min-height: 30px !important;
+    height: auto !important;
+    opacity: 1 !important;
+    filter: none !important;
+    transition: background 0.1s !important;
+}}
+section[data-testid="stSidebar"] [data-testid="baseButton-secondary"]:hover {{
+    background: rgba(255,68,31,0.12) !important;
+}}
+
+/* Collapse gap between nav items */
+section[data-testid="stSidebar"] .stButton {{
+    margin-bottom: -3px !important;
+    margin-top: 0 !important;
+}}
 
 /* ── Sidebar ── */
 section[data-testid="stSidebar"] > div:first-child {{
@@ -149,54 +192,77 @@ section[data-testid="stSidebar"] > div:first-child {{
 section[data-testid="stSidebar"] p,
 section[data-testid="stSidebar"] label,
 section[data-testid="stSidebar"] .stMarkdown p {{
-    color: rgba(255,255,255,0.78) !important;
+    color: rgba(255,255,255,0.82) !important;
+}}
+
+/* ── Nav button TEXT — placed after general p rule to win cascade ── */
+:root section[data-testid="stSidebar"] [data-testid="baseButton-primary"],
+:root section[data-testid="stSidebar"] [data-testid="baseButton-primary"] *,
+:root section[data-testid="stSidebar"] button[kind="primary"],
+:root section[data-testid="stSidebar"] button[kind="primary"] * {{
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    opacity: 1 !important;
+    filter: none !important;
+}}
+:root section[data-testid="stSidebar"] [data-testid="baseButton-secondary"],
+:root section[data-testid="stSidebar"] [data-testid="baseButton-secondary"] *,
+:root section[data-testid="stSidebar"] button[kind="secondary"],
+:root section[data-testid="stSidebar"] button[kind="secondary"] * {{
+    color: {RAPPI_RED} !important;
+    -webkit-text-fill-color: {RAPPI_RED} !important;
+    opacity: 1 !important;
+    filter: none !important;
 }}
 section[data-testid="stSidebar"] h1,
 section[data-testid="stSidebar"] h2,
 section[data-testid="stSidebar"] h3 {{
-    color: rgba(255,255,255,0.95) !important;
+    color: rgba(255,255,255,0.96) !important;
 }}
 section[data-testid="stSidebar"] .stSelectbox > div,
 section[data-testid="stSidebar"] .stMultiSelect > div {{
     background: rgba(255,255,255,0.07) !important;
 }}
 section[data-testid="stSidebar"] hr {{
-    border-color: rgba(255,255,255,0.12) !important;
+    border-color: rgba(255,255,255,0.07) !important;
+    margin: 6px 0 !important;
 }}
 
-/* ── Sidebar shortcut buttons ── */
-section[data-testid="stSidebar"] .stButton > button {{
-    background: rgba(255,255,255,0.06) !important;
+/* ── Sidebar action buttons (e.g. Nueva sesion) ── */
+section[data-testid="stSidebar"] [data-testid="baseButton-tertiary"] {{
+    background: transparent !important;
     border: 1px solid rgba(255,255,255,0.10) !important;
-    color: rgba(255,255,255,0.80) !important;
-    border-radius: 10px !important;
-    font-size: 12.5px !important;
-    font-weight: 500 !important;
+    color: rgba(255,255,255,0.42) !important;
+    border-radius: 6px !important;
+    font-size: 11.5px !important;
+    font-weight: 400 !important;
     text-align: left !important;
     justify-content: flex-start !important;
-    padding: 9px 13px !important;
-    transition: all 0.15s !important;
+    padding: 5px 12px !important;
+    min-height: 28px !important;
+    height: auto !important;
+    transition: background 0.1s, color 0.1s !important;
 }}
-section[data-testid="stSidebar"] .stButton > button:hover {{
-    background: rgba(255,68,31,0.18) !important;
-    border-color: rgba(255,68,31,0.40) !important;
-    color: #FFFFFF !important;
+section[data-testid="stSidebar"] [data-testid="baseButton-tertiary"]:hover {{
+    background: rgba(255,255,255,0.06) !important;
+    color: rgba(255,255,255,0.75) !important;
+    border-color: rgba(255,255,255,0.18) !important;
 }}
 /* ── Sidebar expander ── */
 section[data-testid="stSidebar"] [data-testid="stExpander"] {{
-    border: 1px solid rgba(255,255,255,0.10) !important;
-    border-radius: 10px !important;
-    background: rgba(255,255,255,0.03) !important;
-    margin-top: 4px !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
+    border-radius: 6px !important;
+    background: rgba(255,255,255,0.02) !important;
+    margin-top: 2px !important;
 }}
 section[data-testid="stSidebar"] [data-testid="stExpander"] summary p {{
-    color: rgba(255,255,255,0.55) !important;
-    font-size: 11.5px !important;
-    font-weight: 600 !important;
+    color: rgba(255,255,255,0.45) !important;
+    font-size: 11px !important;
+    font-weight: 500 !important;
 }}
 section[data-testid="stSidebar"] .stCaption p {{
-    color: rgba(255,255,255,0.35) !important;
-    font-size: 10.5px !important;
+    color: rgba(255,255,255,0.28) !important;
+    font-size: 10px !important;
 }}
 
 /* ── Chat: base defaults (enhanced in tab_chat scope) ── */
@@ -246,61 +312,86 @@ all_metrics   = get_metrics(metrics_df)
 with st.sidebar:
     # Brand mark
     st.markdown(
-        f"""<div style="padding:20px 4px 18px 4px;border-bottom:1px solid rgba(255,255,255,0.1);
-                        margin-bottom:16px;">
-          <div style="display:flex;align-items:center;gap:10px;">
-            <div style="width:34px;height:34px;background:{RAPPI_RED};border-radius:9px;
+        f"""<div style="padding:16px 4px 14px 4px;border-bottom:1px solid rgba(255,255,255,0.07);
+                        margin-bottom:10px;">
+          <div style="display:flex;align-items:center;gap:9px;">
+            <div style="width:26px;height:26px;background:{RAPPI_RED};border-radius:7px;
                         display:flex;align-items:center;justify-content:center;flex-shrink:0;">
-              <span style="font-size:18px;line-height:1;">🛵</span>
+              <span style="font-size:13px;font-weight:900;color:white;letter-spacing:-0.5px;
+                           font-family:Inter,-apple-system,sans-serif;line-height:1;">R</span>
             </div>
             <div>
-              <div style="font-size:18px;font-weight:900;color:#FFFFFF;letter-spacing:-0.3px;
-                          line-height:1.1;">rappi</div>
-              <div style="font-size:9.5px;font-weight:600;color:rgba(255,255,255,0.45);
-                          letter-spacing:1.8px;text-transform:uppercase;">operations</div>
+              <div style="font-size:14px;font-weight:800;color:#FFFFFF;letter-spacing:-0.2px;
+                          line-height:1.15;">rappi</div>
+              <div style="font-size:8.5px;font-weight:500;color:rgba(255,255,255,0.38);
+                          letter-spacing:1.6px;text-transform:uppercase;margin-top:1px;">operations</div>
             </div>
           </div>
         </div>""",
         unsafe_allow_html=True,
     )
 
-    # ── Quick analysis shortcuts ───────────────────────────────────────────────
-    st.markdown(
-        "<p style='font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;"
-        "color:rgba(255,255,255,0.35);margin-bottom:8px;margin-top:0;'>ANÁLISIS RÁPIDO</p>",
-        unsafe_allow_html=True,
-    )
-    _SHORTCUTS = [
-        ("⚠️  Alertas críticas",    "¿Cuáles son las zonas con mayor deterioro SaS esta semana?"),
-        ("📈  Mayor crecimiento",    "Top 10 zonas con mayor crecimiento de pedidos en las últimas 4 semanas"),
-        ("🌎  Benchmarking países",  "Compara Perfect Orders entre todos los países LATAM"),
-        ("💡  Oportunidades",        "Principales zonas de oportunidad en Lead Penetration esta semana"),
-        ("🏆  Top Perfect Orders",   "Top 10 zonas por Perfect Orders en la red esta semana"),
-        ("💰  Gross Profit UE",      "Ranking de países por Gross Profit UE esta semana"),
-    ]
-    for _lbl, _q in _SHORTCUTS:
-        if st.button(_lbl, key=f"sc_{abs(hash(_lbl)) % 99991}", use_container_width=True):
-            st.session_state._pending_question = _q
-            st.rerun()
+    # ── Navigation ────────────────────────────────────────────────────────────
+    if "active_page" not in st.session_state:
+        st.session_state.active_page = "Copiloto IA"
 
-    # Nueva sesión
+    for _lbl in ["Copiloto IA", "Insights Operacionales"]:
+        _active = st.session_state.get("active_page", "Copiloto IA") == _lbl
+        st.button(
+            _lbl,
+            key=f"nav_{abs(hash(_lbl)) % 99991}",
+            use_container_width=True,
+            type="primary" if _active else "secondary",
+            on_click=lambda lbl=_lbl: st.session_state.update({"active_page": lbl}),
+        )
+
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-    if st.button("↺  Nueva sesión", key="sidebar_new_session", use_container_width=True):
+    st.markdown("---")
+
+    if st.button("Nueva sesión", key="sidebar_new_session", use_container_width=True):
         st.session_state.chat_messages = []
         st.session_state.api_history   = []
         st.rerun()
 
-    st.markdown("---")
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+    # ── Late CSS injection — overrides Streamlit emotion-CSS button text ──────
+    st.markdown(f"""<style>
+:root section[data-testid="stSidebar"] [data-testid="baseButton-secondary"],
+:root section[data-testid="stSidebar"] [data-testid="baseButton-secondary"] p,
+:root section[data-testid="stSidebar"] [data-testid="baseButton-secondary"] span,
+:root section[data-testid="stSidebar"] [data-testid="baseButton-secondary"] div,
+:root section[data-testid="stSidebar"] [data-testid="baseButton-secondary"] em,
+:root section[data-testid="stSidebar"] button[kind="secondary"],
+:root section[data-testid="stSidebar"] button[kind="secondary"] * {{
+    color: {RAPPI_RED} !important;
+    -webkit-text-fill-color: {RAPPI_RED} !important;
+    opacity: 1 !important;
+    filter: none !important;
+}}
+:root section[data-testid="stSidebar"] [data-testid="baseButton-primary"],
+:root section[data-testid="stSidebar"] [data-testid="baseButton-primary"] p,
+:root section[data-testid="stSidebar"] [data-testid="baseButton-primary"] span,
+:root section[data-testid="stSidebar"] [data-testid="baseButton-primary"] div,
+:root section[data-testid="stSidebar"] [data-testid="baseButton-primary"] em,
+:root section[data-testid="stSidebar"] button[kind="primary"],
+:root section[data-testid="stSidebar"] button[kind="primary"] * {{
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    opacity: 1 !important;
+    filter: none !important;
+}}
+</style>""", unsafe_allow_html=True)
 
     # ── Status footer ──────────────────────────────────────────────────────────
     _prov_key  = {"claude": "ANTHROPIC_API_KEY", "gemini": "GEMINI_API_KEY"}.get(ai_provider.name, "ANTHROPIC_API_KEY")
     api_status = "Activo" if os.environ.get(_prov_key) else "Sin clave API"
     api_color  = "#10B981" if os.environ.get(_prov_key) else "#F59E0B"
     st.markdown(
-        f"<div style='font-size:10.5px;color:rgba(255,255,255,0.38);line-height:2.0;'>"
-        f"<span style='color:{api_color};'>&#9679;</span> IA Copiloto: "
-        f"<span style='color:rgba(255,255,255,0.58);font-weight:600;'>{api_status}</span><br>"
-        f"Rappi AI Engineer Assessment · 2025</div>",
+        f"<div style='font-size:10px;color:rgba(255,255,255,0.30);line-height:1.9;padding-top:2px;'>"
+        f"<span style='color:{api_color};font-size:7px;vertical-align:middle;'>&#9679;</span>"
+        f" IA {api_status} &nbsp;·&nbsp; "
+        f"<span style='color:rgba(255,255,255,0.22);'>Rappi 2025</span></div>",
         unsafe_allow_html=True,
     )
 
@@ -314,74 +405,124 @@ filtered_df      = metrics_df
 
 
 # ── Insight card renderer ─────────────────────────────────────────────────────
-def _render_card(insight: dict) -> None:
-    cfg   = SEVERITY_CONFIG[insight["severity"]]
-    color = cfg["color"]
-    label = cfg["label"]
-    delta = insight["delta_pct"]
-    delta_str  = f"{delta:+.1f}%"
-    delta_color = GREEN if delta > 0 else RED_ALERT
-    st.markdown(
-        f"""
-        <div style="border-left:4px solid {color};background:{CARD_BG};border-radius:0 10px 10px 0;
-                    padding:14px 18px;margin-bottom:10px;
-                    box-shadow:0 1px 4px rgba(28,28,40,0.07);">
-          <div style="margin-bottom:8px;display:flex;align-items:center;gap:7px;flex-wrap:wrap;">
-            <span style="background:{color};color:white;font-size:9.5px;font-weight:700;
-                         letter-spacing:.6px;padding:3px 9px;border-radius:100px;">{label}</span>
-            <span style="background:#F1F3F9;color:{delta_color};font-size:10px;font-weight:700;
-                         padding:3px 9px;border-radius:100px;">{delta_str}</span>
-            <span style="font-weight:700;font-size:14px;color:{TEXT_PRI};">{insight['title']}</span>
-          </div>
-          <p style="margin:4px 0;color:{TEXT_PRI};font-size:13.5px;line-height:1.5;">
-            <b>Hallazgo:</b> {insight['finding']}</p>
-          <p style="margin:4px 0;color:#4B5563;font-size:12.5px;line-height:1.5;">
-            <b>Por que importa:</b> {insight['explanation']}</p>
-          <p style="margin:4px 0 0 0;color:{BLUE};font-size:12.5px;line-height:1.5;">
-            <b>Accion recomendada:</b> {insight['action']}</p>
-          <p style="margin:8px 0 0 0;color:#9CA3AF;font-size:10.5px;">
-            {insight['country']} &nbsp;·&nbsp; {insight['city']}
-            &nbsp;·&nbsp; {insight['zone']} &nbsp;·&nbsp; {insight['metric']}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+
+def _card_html(insight: dict) -> str:
+    """Compact insight card HTML — collapsed by default, full detail on expand."""
+    sev_cfg   = SEVERITY_CONFIG[insight["severity"]]
+    cat_cfg   = CATEGORY_CONFIG.get(insight.get("category", "anomaly"), {})
+    color     = sev_cfg["color"]
+    label     = sev_cfg["label"]
+    cat_lbl   = cat_cfg.get("label", "")
+    cat_emoji = cat_cfg.get("emoji", "")
+    cat_col   = cat_cfg.get("color", TEXT_SEC)
+    delta     = insight["delta_pct"]
+    sev       = insight["severity"]
+
+    if sev == "opportunity":
+        delta_str, delta_color = f"▼ {abs(delta):.1f}%", RED_ALERT
+    elif sev == "positive":
+        delta_str, delta_color = f"▲ {delta:.1f}%", GREEN
+    else:
+        delta_str  = f"{delta:+.1f}%"
+        delta_color = RED_ALERT if delta < 0 else GREEN
+
+    score_str = f"{insight.get('score', 0):.0f}"
+    title     = _H(insight["title"])
+    finding   = _H(insight["finding"])
+    expl      = _H(insight["explanation"])
+    action    = _H(insight["action"])
+    meta      = (f"{_H(insight['country'])} · {_H(insight['city'])} · "
+                 f"{_H(insight['zone'])} · {_H(insight['metric'])}")
+
+    return (
+        f'<div style="border-left:3px solid {color};background:{CARD_BG};'
+        f'border-radius:0 6px 6px 0;padding:7px 12px 5px 11px;margin-bottom:4px;'
+        f'box-shadow:0 1px 2px rgba(28,28,40,0.04);">'
+        # — header row: badges + title + delta
+        f'<div style="display:flex;align-items:center;gap:5px;overflow:hidden;">'
+        f'<span style="background:{color};color:#fff;font-size:9px;font-weight:700;'
+        f'letter-spacing:.4px;padding:2px 7px;border-radius:100px;flex-shrink:0;">{label}</span>'
+        f'<span style="background:{cat_col}1A;color:{cat_col};font-size:9px;font-weight:600;'
+        f'padding:2px 6px;border-radius:100px;flex-shrink:0;">{cat_emoji} {cat_lbl}</span>'
+        f'<span style="background:#F1F3F9;color:{TEXT_SEC};font-size:9px;font-weight:600;'
+        f'padding:2px 6px;border-radius:100px;flex-shrink:0;">S {score_str}</span>'
+        f'<span style="font-weight:600;font-size:12.5px;color:{TEXT_PRI};flex:1;'
+        f'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{title}</span>'
+        f'<span style="background:{delta_color}1A;color:{delta_color};font-size:9.5px;'
+        f'font-weight:700;padding:2px 7px;border-radius:100px;flex-shrink:0;'
+        f'white-space:nowrap;">{delta_str}</span>'
+        f'</div>'
+        # — one-line finding preview
+        f'<div style="font-size:11px;color:{TEXT_SEC};margin-top:2px;'
+        f'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{finding}</div>'
+        # — expandable full detail
+        f'<details>'
+        f'<summary style="cursor:pointer;font-size:10px;color:{BLUE};list-style:none;'
+        f'outline:none;user-select:none;display:inline-block;margin-top:2px;">'
+        f'&#9656; Ver detalle</summary>'
+        f'<div style="margin-top:6px;padding-top:6px;border-top:1px solid {BORDER};'
+        f'font-size:12px;line-height:1.5;">'
+        f'<p style="margin:0 0 4px;color:{TEXT_PRI};"><b>Hallazgo:</b> {finding}</p>'
+        f'<p style="margin:0 0 4px;color:#4B5563;"><b>Por qué importa:</b> {expl}</p>'
+        f'<p style="margin:0 0 4px;color:{BLUE};"><b>Acción:</b> {action}</p>'
+        f'<p style="margin:4px 0 0;color:#9CA3AF;font-size:10px;">{meta}</p>'
+        f'</div>'
+        f'</details>'
+        f'</div>'
     )
+
+
+def _cards_html(items: list[dict]) -> None:
+    """Render a list of insight cards as a single HTML block (enables native <details> toggle)."""
+    if not items:
+        return
+    block = '<div style="display:flex;flex-direction:column;">'
+    for ins in items:
+        block += _card_html(ins)
+    block += "</div>"
+    st.markdown(block, unsafe_allow_html=True)
 
 
 # ── Shared chart style helper ─────────────────────────────────────────────────
+_FONT = "Inter, -apple-system, BlinkMacSystemFont, sans-serif"
+
 def _chart(fig: go.Figure) -> go.Figure:
     fig.update_layout(
-        font_family="Inter, -apple-system, sans-serif",
-        paper_bgcolor="white",
-        plot_bgcolor="white",
+        font=dict(family=_FONT, size=11, color=TEXT_SEC),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
         margin=dict(l=12, r=12, t=40, b=12),
-        title_font_size=13,
-        title_font_color=TEXT_PRI,
+        title_font=dict(size=13, color=TEXT_PRI, family=_FONT),
         legend=dict(
             orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
-            font_size=11,
+            font=dict(size=11, family=_FONT),
+        ),
+        hoverlabel=dict(
+            bgcolor="white", bordercolor=BORDER,
+            font=dict(size=11, family=_FONT),
         ),
     )
-    fig.update_xaxes(showgrid=False, linecolor=BORDER, tickfont_size=11)
-    fig.update_yaxes(gridcolor="#F0F2F8", linecolor="white", tickfont_size=11)
+    fig.update_xaxes(
+        showgrid=False, zeroline=False,
+        linecolor="rgba(228,232,240,0.4)",
+        tickfont=dict(size=11, color=TEXT_SEC),
+    )
+    fig.update_yaxes(
+        gridcolor="rgba(228,232,240,0.55)", gridwidth=0.5,
+        zeroline=False, linecolor="rgba(0,0,0,0)",
+        tickfont=dict(size=11, color=TEXT_SEC),
+    )
     return fig
 
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_chat, tab_insights, tab_cmd, tab_metrics, tab_orders, tab_data = st.tabs([
-    "Copiloto IA",
-    "Alertas e Insights",
-    "Centro de Mando",
-    "Analisis de Metricas",
-    "Pedidos",
-    "Datos",
-])
+# ── Page routing ──────────────────────────────────────────────────────────────
+_page = st.session_state.get("active_page", "Copiloto IA")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 1 · Centro de Mando
+# PAGE · Centro de Mando
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_cmd:
+if _page == "Centro de Mando":
 
     # ── Local filters ─────────────────────────────────────────────────────────
     _fc1, _fc2, _fc3, _fsp = st.columns([2, 3, 1, 4])
@@ -465,14 +606,14 @@ with tab_cmd:
             avg_df, x="COUNTRY", y="avg_value",
             color="_color",
             color_discrete_map={GREEN: GREEN, RED_ALERT: RED_ALERT},
-            template="plotly_white",
+            template=None,
             labels={"avg_value": "Valor prom. W-0", "COUNTRY": ""},
             text="avg_value",
         )
         fig_bench.update_traces(
             texttemplate="%{text:.3f}",
             textposition="outside",
-            textfont_size=10,
+            textfont=dict(size=10, color=TEXT_SEC, family=_FONT),
             marker_line_width=0,
         )
         fig_bench.update_layout(showlegend=False)
@@ -490,12 +631,15 @@ with tab_cmd:
         trend = get_weekly_trend(filtered_df, metric_filter, country=selected_country)
         fig_trend = px.line(
             trend, x="week", y="value", markers=True,
-            template="plotly_white",
+            template=None,
             labels={"value": metric_filter, "week": ""},
             title=scope_lbl,
             color_discrete_sequence=[RAPPI_RED],
         )
-        fig_trend.update_traces(line_width=2.5, marker_size=8, marker_color=RAPPI_RED)
+        fig_trend.update_traces(
+            line=dict(width=2, color=RAPPI_RED),
+            marker=dict(size=5, color=RAPPI_RED, line=dict(color="white", width=1.5)),
+        )
         _chart(fig_trend)
         st.plotly_chart(fig_trend, width='stretch')
 
@@ -541,7 +685,7 @@ with tab_cmd:
         st.markdown("<div class='section-label'>Distribucion por tipo de zona</div>", unsafe_allow_html=True)
         fig_zt = px.bar(
             zt_df, x="ZONE_TYPE", y="avg_value", color="ZONE_TYPE",
-            template="plotly_white",
+            template=None,
             labels={"avg_value": "Valor prom.", "ZONE_TYPE": ""},
             color_discrete_sequence=CHART_COLORS,
             text="avg_value",
@@ -556,9 +700,9 @@ with tab_cmd:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 · Analisis de Metricas
+# PAGE · Analisis de Metricas
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_metrics:
+if _page == "Analisis de Metricas":
     _fm1, _fm2, _fm3, _fmsp = st.columns([2, 3, 1, 4])
     with _fm1:
         _cf = st.selectbox("País", ["Todos"] + all_countries, key="met_country")
@@ -580,12 +724,15 @@ with tab_metrics:
         trend2 = get_weekly_trend(filtered_df, metric_filter, country=selected_country)
         fig_t2 = px.line(
             trend2, x="week", y="value", markers=True,
-            template="plotly_white",
+            template=None,
             labels={"value": "Valor prom.", "week": ""},
             title=scope_lbl2,
             color_discrete_sequence=[RAPPI_RED],
         )
-        fig_t2.update_traces(line_width=2.5, marker_size=8)
+        fig_t2.update_traces(
+            line=dict(width=2, color=RAPPI_RED),
+            marker=dict(size=5, color=RAPPI_RED, line=dict(color="white", width=1.5)),
+        )
         _chart(fig_t2)
         st.plotly_chart(fig_t2, width='stretch')
 
@@ -594,7 +741,7 @@ with tab_metrics:
         zt2 = get_metric_by_zone_type(filtered_df, metric_filter, country=selected_country)
         fig_zt2 = px.bar(
             zt2, x="ZONE_TYPE", y="avg_value", color="ZONE_TYPE",
-            template="plotly_white",
+            template=None,
             labels={"avg_value": "Valor prom.", "ZONE_TYPE": ""},
             color_discrete_sequence=CHART_COLORS,
         )
@@ -609,7 +756,7 @@ with tab_metrics:
         hover_extras = [c for c in ["CITY", "ZONE_PRIORITIZATION"] if c in zone_cmp.columns]
         fig_zc = px.bar(
             zone_cmp, x="ZONE", y="L0W_ROLL", color=color_col,
-            template="plotly_white",
+            template=None,
             labels={"L0W_ROLL": "Valor (ultima semana)", "ZONE": ""},
             hover_data=hover_extras or None,
             color_discrete_sequence=CHART_COLORS,
@@ -629,9 +776,9 @@ with tab_metrics:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 3 · Pedidos
+# PAGE · Pedidos
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_orders:
+if _page == "Pedidos":
     _fo1, _fo2, _fosp = st.columns([2, 1, 7])
     with _fo1:
         _cf = st.selectbox("País", ["Todos"] + all_countries, key="ord_country")
@@ -647,12 +794,15 @@ with tab_orders:
         ord_trend = get_orders_trend(orders_df, country=selected_country)
         fig_ot = px.line(
             ord_trend, x="week", y="orders", markers=True,
-            template="plotly_white",
+            template=None,
             labels={"orders": "Total pedidos", "week": ""},
             title=scope_ord,
             color_discrete_sequence=[RAPPI_RED],
         )
-        fig_ot.update_traces(line_width=2.5, marker_size=8)
+        fig_ot.update_traces(
+            line=dict(width=2, color=RAPPI_RED),
+            marker=dict(size=5, color=RAPPI_RED, line=dict(color="white", width=1.5)),
+        )
         _chart(fig_ot)
         st.plotly_chart(fig_ot, width='stretch')
 
@@ -661,7 +811,7 @@ with tab_orders:
         obc2 = get_orders_by_country(orders_df)
         fig_pie = px.pie(
             obc2, names="COUNTRY", values="total_orders",
-            template="plotly_white", hole=0.42,
+            template=None, hole=0.5,
             color_discrete_sequence=CHART_COLORS,
         )
         fig_pie.update_traces(textposition="inside", textinfo="percent+label")
@@ -693,203 +843,294 @@ with tab_orders:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4 · Alertas e Insights
+# PAGE · Insights Operacionales
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_insights:
+if _page == "Insights Operacionales":
 
-    # Insight filters
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
+    st.markdown("""<style>
+/* ── Insights scroll fix ────────────────────────────────────────────────────────
+   stMain becomes the scroll viewport for this page.
+   block-container height is released so it grows with content naturally.
+   stApp/html/body stay overflow:hidden — no document scroll, no double scrollbar. */
+[data-testid="stMain"] {
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+}
+[data-testid="stMainBlockContainer"],
+.main .block-container {
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    padding-bottom: 80px !important;
+}
+/* Scrollbar on stMain */
+[data-testid="stMain"]::-webkit-scrollbar       { width: 4px; }
+[data-testid="stMain"]::-webkit-scrollbar-track { background: transparent; }
+[data-testid="stMain"]::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.14); border-radius: 2px; }
+[data-testid="stMain"] { scrollbar-width: thin; scrollbar-color: rgba(0,0,0,0.12) transparent; }
+</style>""", unsafe_allow_html=True)
+
+    # ── Compact filter bar ─────────────────────────────────────────────────────
+    _fi1, _fi2, _fi_sp = st.columns([2.5, 2, 4.5])
+    with _fi1:
         ins_metric = st.selectbox(
-            "Metrica", ["Todas"] + all_metrics, key="ins_metric",
+            "Métrica", ["Todas"] + all_metrics, key="ins_metric",
             index=all_metrics.index(metric_filter) + 1,
         )
-    with fc2:
+    with _fi2:
         ins_country = st.selectbox(
-            "Pais", ["Todos"] + all_countries, key="ins_country",
+            "País", ["Todos"] + all_countries, key="ins_country",
             index=(all_countries.index(selected_country) + 1) if selected_country else 0,
-        )
-    with fc3:
-        sev_options = list(SEVERITY_CONFIG.keys())
-        sev_filter = st.multiselect(
-            "Severidad", sev_options,
-            default=sev_options,
-            format_func=lambda s: f"{SEVERITY_CONFIG[s]['emoji']} {SEVERITY_CONFIG[s]['label']}",
-            key="ins_sev",
         )
 
     ins_country_arg = None if ins_country == "Todos" else ins_country
     ins_metric_arg  = None if ins_metric == "Todas" else ins_metric
     insights = generate_insights(filtered_df, country=ins_country_arg, metric=ins_metric_arg)
-    insights = [i for i in insights if i["severity"] in sev_filter]
     counts   = count_by_severity(insights)
+    _crit    = counts.get("critical", 0)
+    _warn    = counts.get("warning", 0)
+    _opp     = counts.get("opportunity", 0)
+    _pos     = counts.get("positive", 0)
+    _total   = len(insights)
 
-    # Severity summary KPIs
-    kc, kw, ko, kp = st.columns(4)
-    kc.metric("🔴 Critico",       counts.get("critical", 0))
-    kw.metric("🟠 Alerta",        counts.get("warning", 0))
-    ko.metric("🔵 Oportunidades", counts.get("opportunity", 0))
-    kp.metric("🟢 Positivo",      counts.get("positive", 0))
+    # Executive selection — top-10 by default; full pool on demand.
+    # Key includes filter values so changing filters resets to executive view.
+    _show_all_key  = f"ins_show_all_{ins_country}_{ins_metric}"
+    _show_all      = st.session_state.get(_show_all_key, False)
+    _exec_insights = insights if _show_all else prioritize_insights(insights, top_n=10)
 
-    st.markdown("---")
+    # ── Severity summary + total — compact pill strip ──────────────────────────
+    st.markdown(
+        f"""<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+                        padding:8px 0 10px;border-bottom:1px solid {BORDER};">
+          <span style="background:{RED_ALERT};color:#fff;font-size:11px;font-weight:700;
+                       padding:3px 11px;border-radius:100px;">{_crit} Critico</span>
+          <span style="background:{AMBER};color:#fff;font-size:11px;font-weight:700;
+                       padding:3px 11px;border-radius:100px;">{_warn} Alerta</span>
+          <span style="background:{BLUE};color:#fff;font-size:11px;font-weight:700;
+                       padding:3px 11px;border-radius:100px;">{_opp} Oportunidad</span>
+          <span style="background:{GREEN};color:#fff;font-size:11px;font-weight:700;
+                       padding:3px 11px;border-radius:100px;">{_pos} Positivo</span>
+          <span style="margin-left:auto;font-size:12px;color:{TEXT_SEC};">
+            <b style="color:{TEXT_PRI};font-size:16px;">{_total}</b> insights</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
-    # Alert banner
-    n_crit_i = counts.get("critical", 0)
-    n_warn_i = counts.get("warning", 0)
-    if n_crit_i:
+    # ── Category breakdown strip ────────────────────────────────────────────────
+    cat_counts = count_by_category(insights)
+    _cat_cols  = st.columns(5)
+    for _ci, (_cat_key, _cat_cfg) in enumerate(CATEGORY_CONFIG.items()):
+        _n   = cat_counts.get(_cat_key, 0)
+        _col = _cat_cfg["color"]
+        _cat_cols[_ci].markdown(
+            f"""<div style="background:{_col}10;border:1px solid {_col}28;border-radius:8px;
+                            padding:6px 8px;text-align:center;margin-top:4px;">
+              <div style="font-size:16px;font-weight:800;color:{_col};line-height:1.1;">{_n}</div>
+              <div style="font-size:9px;font-weight:600;color:{_col};letter-spacing:.3px;
+                          text-transform:uppercase;margin-top:1px;opacity:.85;">
+                {_cat_cfg['emoji']} {_cat_cfg['label']}</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+    # ── Executive view toggle ──────────────────────────────────────────────────
+    _n_exec = len(_exec_insights)
+    _info_c, _btn_c = st.columns([5, 2])
+    with _info_c:
+        _mode_desc = (
+            f"Top <b>{_n_exec}</b> de <b>{_total}</b> &nbsp;·&nbsp; selección ejecutiva"
+            if not _show_all else
+            f"Mostrando todos los <b>{_total}</b> insights"
+        )
+        st.markdown(
+            f"<div style='font-size:11.5px;color:{TEXT_SEC};padding:3px 0;'>{_mode_desc}</div>",
+            unsafe_allow_html=True,
+        )
+    with _btn_c:
+        _toggle_lbl = f"Ver todos ({_total})" if not _show_all else "Vista ejecutiva"
+        st.button(
+            _toggle_lbl,
+            key="ins_toggle",
+            on_click=lambda k=_show_all_key, v=_show_all: st.session_state.update({k: not v}),
+        )
+
+    # ── Alert banner ───────────────────────────────────────────────────────────
+    if _crit:
         st.error(
-            f"⚠️ {n_crit_i} alerta{'s' if n_crit_i > 1 else ''} critica{'s' if n_crit_i > 1 else ''} "
-            f"detectada{'s' if n_crit_i > 1 else ''} — revision operativa inmediata recomendada."
+            f"**{_crit} alerta{'s' if _crit > 1 else ''} critica{'s' if _crit > 1 else ''}** "
+            f"— revision operativa inmediata recomendada."
         )
-    elif n_warn_i:
+    elif _warn:
         st.warning(
-            f"{n_warn_i} alerta{'s' if n_warn_i > 1 else ''} detectada{'s' if n_warn_i > 1 else ''} "
-            "— monitorear de cerca y preparar planes de respuesta."
+            f"**{_warn} alerta{'s' if _warn > 1 else ''}** "
+            f"requiere{'n' if _warn > 1 else ''} seguimiento esta semana."
         )
-    else:
-        st.success("Sin alertas criticas ni advertencias en la seleccion actual.")
 
-    # Insight cards
-    if not insights:
-        st.info("Ningun insight coincide con los filtros seleccionados.")
+    # ── Insight cards ──────────────────────────────────────────────────────────
+    if not _exec_insights:
+        st.info("Sin insights para la seleccion actual.")
     else:
-        st.markdown(f"**{len(insights)} insights** · ordenados por severidad y magnitud")
-        st.markdown("")
-        left_items  = [i for i in insights if i["severity"] in ("critical", "warning")]
-        right_items = [i for i in insights if i["severity"] in ("opportunity", "positive")]
+        left_items  = [i for i in _exec_insights if i["severity"] in ("critical", "warning")]
+        right_items = [i for i in _exec_insights if i["severity"] in ("opportunity", "positive")]
 
         if left_items and right_items:
             col_l, col_r = st.columns(2)
             with col_l:
                 st.markdown(
-                    f"<div class='section-label' style='color:{RED_ALERT};'>Alertas</div>",
+                    f"<div class='section-label' style='color:{RED_ALERT};'>"
+                    f"Alertas · {len(left_items)}</div>",
                     unsafe_allow_html=True,
                 )
-                for ins in left_items:
-                    _render_card(ins)
+                _cards_html(left_items)
             with col_r:
                 st.markdown(
-                    f"<div class='section-label' style='color:{GREEN};'>Oportunidades y Logros</div>",
+                    f"<div class='section-label' style='color:{GREEN};'>"
+                    f"Oportunidades y Logros · {len(right_items)}</div>",
                     unsafe_allow_html=True,
                 )
-                for ins in right_items:
-                    _render_card(ins)
+                _cards_html(right_items)
         else:
-            for ins in insights:
-                _render_card(ins)
+            _cards_html(_exec_insights)
 
-    # Anomaly detail tables
-    st.markdown("---")
-    st.subheader("Tablas de detalle")
-
-    _COLS = ["severity", "country", "city", "zone", "metric", "value", "delta_pct"]
-
-    atab_dec, atab_consec, atab_opp, atab_pos = st.tabs(
-        ["Caidas SaS", "Tendencias 3 Semanas", "Oportunidades", "Mejoras"]
+    # ── Category detail tabs ────────────────────────────────────────────────────
+    st.markdown(
+        f"<div style='border-top:1px solid {BORDER};margin-top:14px;padding-top:10px;'>"
+        f"<span style='font-size:10.5px;font-weight:700;letter-spacing:1.1px;"
+        f"text-transform:uppercase;color:{TEXT_SEC};'>Detalle por categoría</span></div>",
+        unsafe_allow_html=True,
     )
 
-    with atab_dec:
-        rows = [i for i in insights
-                if i["severity"] in ("critical", "warning") and "tendencia" not in i["title"].lower()]
-        if rows:
-            df_dec = pd.DataFrame(rows)[[c for c in _COLS if c in pd.DataFrame(rows).columns]]
-            st.dataframe(df_dec.sort_values("delta_pct"), width='stretch', hide_index=True)
-        else:
-            st.info("Sin alertas de caida SaS en la seleccion actual.")
+    _COLS = ["severity", "category", "score", "country", "city", "zone", "metric", "value", "delta_pct"]
 
-    with atab_consec:
-        rows = [i for i in insights if "tendencia" in i["title"].lower()]
-        if rows:
-            df_con = pd.DataFrame(rows)[[c for c in _COLS if c in pd.DataFrame(rows).columns]]
-            st.dataframe(df_con.sort_values("delta_pct"), width='stretch', hide_index=True)
-        else:
-            st.info("Sin tendencias bajistas de 3 semanas en la seleccion actual.")
+    (atab_anom, atab_trend, atab_bench,
+     atab_corr, atab_opp_t, atab_pos) = st.tabs([
+        "🔺 Anomalías", "📉 Tendencias", "🌎 Benchmarking",
+        "🔗 Correlaciones", "💡 Oportunidades", "🟢 Mejoras",
+    ])
 
-    with atab_opp:
-        rows = [i for i in insights if i["severity"] == "opportunity"]
-        if rows:
-            df_opp = pd.DataFrame(rows)[[c for c in _COLS if c in pd.DataFrame(rows).columns]]
-            st.dataframe(df_opp.sort_values("delta_pct"), width='stretch', hide_index=True)
-        else:
-            st.info("Sin zonas de oportunidad en la seleccion actual.")
+    def _cat_table(tab, cat_key: str) -> None:
+        with tab:
+            rows = [i for i in insights if i.get("category") == cat_key]
+            if rows:
+                _df = pd.DataFrame(rows)[[c for c in _COLS if c in pd.DataFrame(rows).columns]]
+                st.dataframe(_df.sort_values("score", ascending=False), width='stretch', hide_index=True)
+            else:
+                st.info(f"Sin insights de categoría '{CATEGORY_CONFIG[cat_key]['label']}' en la seleccion actual.")
+
+    _cat_table(atab_anom,  "anomaly")
+    _cat_table(atab_trend, "trend")
+    _cat_table(atab_bench, "benchmark")
+    _cat_table(atab_corr,  "correlation")
+    _cat_table(atab_opp_t, "opportunity")
 
     with atab_pos:
         rows = [i for i in insights if i["severity"] == "positive"]
         if rows:
-            df_pos = pd.DataFrame(rows)[[c for c in _COLS if c in pd.DataFrame(rows).columns]]
-            st.dataframe(
-                df_pos.sort_values("delta_pct", ascending=False),
-                width='stretch', hide_index=True,
-            )
+            _df = pd.DataFrame(rows)[[c for c in _COLS if c in pd.DataFrame(rows).columns]]
+            st.dataframe(_df.sort_values("score", ascending=False), width='stretch', hide_index=True)
         else:
-            st.info("Sin zonas con mejora positiva en la seleccion actual.")
+            st.info("Sin mejoras positivas en la seleccion actual.")
 
-    # ── Executive Report ───────────────────────────────────────────────────────
-    st.markdown("---")
+    # ── Exportación de resultados ────────────────────────────────────────────────
+    st.markdown(
+        f"<div style='border-top:1px solid {BORDER};margin-top:14px;padding-top:12px;'></div>",
+        unsafe_allow_html=True,
+    )
 
-    rep_header, rep_actions = st.columns([3, 2])
-    with rep_header:
+    _exp_hdr, _exp_csv, _exp_gen = st.columns([3, 1.5, 1.5])
+    with _exp_hdr:
         st.markdown(
-            f"<div style='font-size:15px;font-weight:700;color:{TEXT_PRI};margin-bottom:2px;'>"
-            f"Informe Ejecutivo</div>"
-            f"<div style='font-size:12.5px;color:{TEXT_SEC};'>"
-            f"Genera un informe completo con todos los insights actuales en formato HTML y Markdown."
+            f"<div style='font-size:14px;font-weight:700;color:{TEXT_PRI};margin-bottom:2px;'>"
+            f"Exportación de resultados</div>"
+            f"<div style='font-size:12px;color:{TEXT_SEC};'>"
+            f"CSV disponible de inmediato · HTML, PDF y Markdown requieren generar el informe."
             f"</div>",
             unsafe_allow_html=True,
         )
-    with rep_actions:
-        st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-        if st.button("Generar Informe Ejecutivo", type="primary", key="btn_gen_report",
-                     width='stretch'):
-            with st.spinner("Generando informe..."):
-                _trend_df = get_weekly_trend(filtered_df, ins_metric_arg or metric_filter,
-                                             country=ins_country_arg)
-                _avg_df   = get_country_averages(filtered_df, ins_metric_arg or metric_filter)
+    with _exp_csv:
+        st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
+        _csv_data = generate_insights_csv(insights).encode("utf-8")
+        _csv_scope = (ins_country_arg or "latam").lower().replace(" ", "_")
+        st.download_button(
+            "Exportar CSV",
+            data=_csv_data,
+            file_name=f"insights_rappi_{_csv_scope}.csv",
+            mime="text/csv",
+            width="stretch",
+            key="dl_csv_quick",
+            help=f"Descarga los {len(insights)} insights actuales como CSV (Excel/Sheets)",
+        )
+    with _exp_gen:
+        st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
+        if st.button("Generar Informe", type="primary", key="btn_gen_report", width="stretch"):
+            with st.spinner("Generando informe (HTML · PDF · MD)…"):
+                _trend_df     = get_weekly_trend(filtered_df, ins_metric_arg or metric_filter,
+                                                 country=ins_country_arg)
+                _avg_df       = get_country_averages(filtered_df, ins_metric_arg or metric_filter)
+                _rep_insights = prioritize_insights(insights, top_n=15)
+                _rep_metric   = ins_metric_arg or metric_filter
+
                 st.session_state["_report_html"] = generate_html_report(
-                    insights, summary,
-                    ins_metric_arg or metric_filter,
-                    ins_country_arg,
-                    _avg_df, _trend_df,
+                    _rep_insights, summary, _rep_metric, ins_country_arg, _avg_df, _trend_df,
                 )
                 st.session_state["_report_md"] = generate_markdown_report(
-                    insights, summary,
-                    ins_metric_arg or metric_filter,
-                    ins_country_arg,
-                    _avg_df,
+                    _rep_insights, summary, _rep_metric, ins_country_arg, _avg_df,
                 )
+                try:
+                    st.session_state["_report_pdf"] = generate_pdf_report(
+                        _rep_insights, summary, _rep_metric, ins_country_arg, _avg_df,
+                    )
+                except Exception as _pdf_err:
+                    st.session_state.pop("_report_pdf", None)
+                    st.warning(f"PDF no generado: {_pdf_err}. Instala fpdf2: `pip install fpdf2`")
                 st.session_state["_report_email"] = build_email_body(
-                    insights, summary,
-                    ins_metric_arg or metric_filter,
-                    ins_country_arg,
+                    _rep_insights, summary, _rep_metric, ins_country_arg,
                 )
 
     if st.session_state.get("_report_html"):
-        html_bytes = st.session_state["_report_html"].encode("utf-8")
-        md_bytes   = st.session_state["_report_md"].encode("utf-8")
+        st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
 
-        # Download buttons
-        dl1, dl2, dl3 = st.columns(3)
-        with dl1:
+        # ── Download row ──────────────────────────────────────────────────────
+        _dl_html_b = st.session_state["_report_html"].encode("utf-8")
+        _dl_md_b   = st.session_state["_report_md"].encode("utf-8")
+        _dl_pdf_b  = st.session_state.get("_report_pdf")
+
+        _n_dl = 4 if _dl_pdf_b else 3
+        _dl_cols = st.columns([1] * _n_dl + [1])
+        with _dl_cols[0]:
             st.download_button(
-                "Descargar HTML",
-                data=html_bytes,
+                "Informe HTML",
+                data=_dl_html_b,
                 file_name="informe_ejecutivo_rappi.html",
                 mime="text/html",
-                width='stretch',
+                width="stretch",
                 key="dl_html",
             )
-        with dl2:
+        with _dl_cols[1]:
             st.download_button(
-                "Descargar Markdown",
-                data=md_bytes,
+                "Informe MD",
+                data=_dl_md_b,
                 file_name="informe_ejecutivo_rappi.md",
                 mime="text/markdown",
-                width='stretch',
+                width="stretch",
                 key="dl_md",
             )
-        with dl3:
-            if st.button("Limpiar informe", width='stretch', key="clear_report"):
-                for k in ("_report_html", "_report_md", "_report_email"):
+        if _dl_pdf_b:
+            with _dl_cols[2]:
+                st.download_button(
+                    "Informe PDF",
+                    data=_dl_pdf_b,
+                    file_name="informe_ejecutivo_rappi.pdf",
+                    mime="application/pdf",
+                    width="stretch",
+                    key="dl_pdf",
+                )
+        with _dl_cols[-1]:
+            if st.button("Limpiar", width="stretch", key="clear_report"):
+                for k in ("_report_html", "_report_md", "_report_pdf", "_report_email"):
                     st.session_state.pop(k, None)
                 st.rerun()
 
@@ -916,7 +1157,7 @@ with tab_insights:
                 st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
                 send_clicked = st.button(
                     "Simular envio",
-                    width='stretch',
+                    width="stretch",
                     key="btn_send_email",
                     disabled=not email_to,
                 )
@@ -937,11 +1178,24 @@ with tab_insights:
             )
             components.html(st.session_state["_report_email"], height=380, scrolling=True)
 
+    # stMain overflow is now CSS-controlled (no stale JS state to clean up).
+    # Only need to release the chat input's fixed positioning if stBottom persists in DOM.
+    components.html("""<script>
+(function() {
+    function releaseFixedInput() {
+        var ci = window.parent.document.querySelector('.stChatFloatingInputContainer');
+        if (ci) { ci.style.position = ''; ci.style.left = ''; ci.style.right = ''; ci.style.bottom = ''; ci.style.zIndex = ''; }
+    }
+    releaseFixedInput();
+    setTimeout(releaseFixedInput, 80);
+})();
+</script>""", height=0)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 5 · Copiloto IA
+# PAGE · Copiloto IA
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_chat:
+if _page == "Copiloto IA":
 
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = []
@@ -951,21 +1205,28 @@ with tab_chat:
     _provider_key_map = {"claude": "ANTHROPIC_API_KEY", "gemini": "GEMINI_API_KEY"}
     _key_name   = _provider_key_map.get(ai_provider.name, "ANTHROPIC_API_KEY")
     api_key_set = bool(os.environ.get(_key_name))
-
-    # ── Messaging-app CSS ─────────────────────────────────────────────────────
+    # ── Chat-specific CSS ─────────────────────────────────────────────────────
     st.markdown(f"""
     <style>
-    /* User bubble — right-aligned, RAPPI RED */
-    .umsg {{
-        display: flex;
-        justify-content: flex-end;
-        margin: 2px 0 2px 15%;
+    /* stMain must stay locked on the chat page — scroll is handled by
+       st.container(height=540) for history and a JS-fixed chat input.
+       Explicit override in case Insights CSS residue affects this page. */
+    [data-testid="stMain"] {{
+        overflow: hidden !important;
     }}
+    [data-testid="stMainBlockContainer"],
+    .main .block-container {{
+        height: 100dvh !important;
+        overflow-y: hidden !important;
+        padding-bottom: 0 !important;
+    }}
+    /* User bubble */
+    .umsg {{ display:flex; justify-content:flex-end; margin:3px 0 3px 20%; }}
     .ububble {{
         background: {RAPPI_RED};
         color: #FFFFFF;
         border-radius: 18px 18px 4px 18px;
-        padding: 10px 15px;
+        padding: 9px 14px;
         font-size: 13.5px;
         line-height: 1.55;
         word-break: break-word;
@@ -1006,40 +1267,26 @@ with tab_chat:
         margin: 10px 0 4px !important;
         color: {TEXT_PRI} !important;
     }}
-    /* Chat input bar */
+    /* Chat input — minimal, ChatGPT-like */
     .stChatFloatingInputContainer {{
-        border-top: 1px solid {BORDER} !important;
-        background: {PAGE_BG} !important;
-        padding-top: 10px !important;
+        border-top: none !important;
+        background: linear-gradient(to top, {PAGE_BG} 62%, rgba(245,246,250,0)) !important;
+        padding: 0 max(16px, calc(50% - 380px)) 18px !important;
     }}
     .stChatFloatingInputContainer textarea {{
         font-size: 14px !important;
-        border-radius: 14px !important;
-        border: 1.5px solid {BORDER} !important;
-        background: white !important;
+        border-radius: 26px !important;
+        border: 1px solid rgba(228,232,240,0.9) !important;
+        background: #FFFFFF !important;
+        box-shadow: 0 2px 16px rgba(28,28,40,0.09) !important;
+        padding-left: 20px !important;
+        line-height: 1.5 !important;
+        transition: box-shadow 0.18s, border-color 0.18s !important;
     }}
-    /* Suggestion chips */
-    .chip-row .stButton > button {{
-        background: white;
-        border: 1.5px solid {BORDER};
-        border-radius: 100px;
-        color: {TEXT_PRI};
-        font-size: 12.5px;
-        font-weight: 500;
-        padding: 9px 15px;
-        text-align: left;
-        white-space: normal;
-        height: auto;
-        min-height: 44px;
-        line-height: 1.4;
-        box-shadow: 0 1px 4px rgba(0,0,0,0.04);
-        transition: all 0.15s ease;
-    }}
-    .chip-row .stButton > button:hover {{
-        background: #FFF0EC;
-        border-color: {RAPPI_RED};
-        color: {RAPPI_RED};
-        box-shadow: 0 2px 8px rgba(255,68,31,0.12);
+    .stChatFloatingInputContainer textarea:focus {{
+        border-color: rgba(255,68,31,0.30) !important;
+        box-shadow: 0 2px 16px rgba(28,28,40,0.09), 0 0 0 3px rgba(255,68,31,0.08) !important;
+        outline: none !important;
     }}
     /* Follow-up suggestion chip */
     .followup .stButton > button {{
@@ -1061,19 +1308,53 @@ with tab_chat:
         border-color: #3B82F6;
         color: #1E40AF;
     }}
+    /* Starter prompt chips — light, conversational */
+    .starter-prompt .stButton > button {{
+        background: rgba(255,255,255,0.72);
+        border: 1px solid rgba(228,232,240,0.75);
+        border-radius: 12px;
+        color: {TEXT_SEC};
+        font-size: 12px;
+        font-weight: 400;
+        padding: 9px 14px;
+        height: auto;
+        min-height: 44px;
+        white-space: normal;
+        line-height: 1.45;
+        text-align: left;
+        box-shadow: none;
+        transition: border-color 0.15s, box-shadow 0.15s, color 0.15s, background 0.15s;
+    }}
+    .starter-prompt .stButton > button:hover {{
+        background: #FFFFFF;
+        border-color: rgba(255,68,31,0.35);
+        box-shadow: 0 2px 10px rgba(255,68,31,0.10);
+        color: {TEXT_PRI};
+    }}
+    /* Inline export pills */
+    .chat-ex-btn {{
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 5px 13px;
+        background: transparent;
+        border: 1px solid {BORDER};
+        border-radius: 100px;
+        color: {TEXT_SEC};
+        font-size: 11.5px;
+        font-weight: 500;
+        text-decoration: none;
+        transition: border-color 0.15s, color 0.15s, background 0.15s;
+        font-family: Inter, -apple-system, sans-serif;
+        line-height: 1.4;
+    }}
+    .chat-ex-btn:hover {{
+        border-color: {RAPPI_RED};
+        color: {RAPPI_RED};
+        background: rgba(255,68,31,0.04);
+        text-decoration: none;
+    }}
     </style>
-    """, unsafe_allow_html=True)
-
-    # ── Ultra-minimal status line ─────────────────────────────────────────────
-    dot_color  = GREEN if api_key_set else AMBER
-    status_txt = "Listo" if api_key_set else "Sin clave API"
-    st.markdown(f"""
-    <div style="display:flex;align-items:center;justify-content:flex-end;
-                padding:4px 0 12px 0;margin-bottom:4px;">
-      <span style="width:6px;height:6px;background:{dot_color};border-radius:50%;
-                   display:inline-block;margin-right:5px;"></span>
-      <span style="font-size:11px;color:{TEXT_SEC};">{status_txt}</span>
-    </div>
     """, unsafe_allow_html=True)
 
     if not api_key_set:
@@ -1092,123 +1373,148 @@ with tab_chat:
             with st.chat_message("assistant", avatar="🛵"):
                 body, suggestion = extract_suggested_question(msg["content"])
                 st.markdown(body)
-                if msg.get("chart_spec"):
-                    fig = render_chart_from_spec(
+                _hist_fig = None
+                if msg.get("user_question"):
+                    _hist_intent = detect_question_intent(msg["user_question"], metrics_df)
+                    _hist_fig = compute_intent_chart(
+                        metrics_df, orders_df, _hist_intent, msg["user_question"]
+                    )
+                if _hist_fig is None and msg.get("chart_spec"):
+                    _hist_fig = render_chart_from_spec(
                         msg["chart_spec"], metrics_df, orders_df, None, compact=True
                     )
-                    if fig:
-                        col_c, _ = st.columns([3, 1])
-                        with col_c:
-                            st.plotly_chart(fig, width="stretch")
+                if _hist_fig:
+                    _cc, _ = st.columns([5, 3])
+                    with _cc:
+                        st.plotly_chart(_hist_fig, use_container_width=True)
                 if suggestion and api_key_set:
+                    _fu_key = f"fu_{abs(hash(suggestion + body[:20])) % 999983}"
                     st.markdown('<div class="followup">', unsafe_allow_html=True)
-                    if st.button(
+                    st.button(
                         f"💡  {suggestion}",
-                        key=f"fu_{abs(hash(suggestion + body[:20])) % 999983}",
-                    ):
-                        st.session_state._pending_question = suggestion
-                        st.rerun()
+                        key=_fu_key,
+                        on_click=lambda q=suggestion: st.session_state.update(
+                            {"_pending_question": q}
+                        ),
+                    )
                     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Resolve pending + input BEFORE rendering decisions ───────────────────
+    # ── 1. Reserve history slot FIRST — this anchors it above everything below ──
+    try:
+        _chat_area = st.container(height=540, border=False)
+    except TypeError:
+        _chat_area = st.container()
+
+    # ── 2. Inline export bar — only when conversation has AI responses ────────
+    _chat_msgs = st.session_state.get("chat_messages", [])
+    if any(m["role"] == "assistant" for m in _chat_msgs):
+        _ex_csv_b64 = _ex_pdf_b64 = ""
+        try:
+            _ex_csv_b64 = base64.b64encode(
+                generate_chat_csv(_chat_msgs).encode("utf-8")
+            ).decode()
+        except Exception:
+            pass
+        try:
+            _ex_pdf_b64 = base64.b64encode(
+                generate_chat_pdf(_chat_msgs)
+            ).decode()
+        except Exception:
+            pass
+
+        _ex_links = ""
+        if _ex_pdf_b64:
+            _ex_links += (
+                f'<a href="data:application/pdf;base64,{_ex_pdf_b64}" '
+                f'download="copiloto_rappi.pdf" class="chat-ex-btn">📄 Exportar PDF</a>'
+            )
+        if _ex_csv_b64:
+            _ex_links += (
+                f'<a href="data:text/csv;base64,{_ex_csv_b64}" '
+                f'download="copiloto_rappi.csv" class="chat-ex-btn">📊 Exportar CSV</a>'
+            )
+        if _ex_links:
+            st.markdown(
+                f'<div style="display:flex;justify-content:flex-end;gap:7px;'
+                f'padding:5px 0 10px;align-items:center;">{_ex_links}</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── 3. Input renders here in DOM = BELOW the history slot ─────────────────
     pending    = st.session_state.pop("_pending_question", None)
     user_input = st.chat_input(
         "Pregunta sobre operaciones Rappi...",
         disabled=not api_key_set,
     ) or pending
 
-    # ── Clear button ──────────────────────────────────────────────────────────
-    if st.session_state.chat_messages:
-        _, clr_col = st.columns([7, 1])
-        with clr_col:
-            if st.button("Limpiar", key="clear_chat", width="stretch"):
-                st.session_state.chat_messages = []
-                st.session_state.api_history   = []
-                st.rerun()
+    # ── 4. Append new message to state, then fill the history slot ────────────
+    if user_input:
+        st.session_state.chat_messages.append({"role": "user", "content": user_input})
 
-    # ── Empty state (only when conversation is truly blank) ───────────────────
-    if not st.session_state.chat_messages and not user_input:
-        st.markdown(f"""
-        <div style="text-align:center;padding:60px 0 36px;">
-          <div style="width:64px;height:64px;background:{RAPPI_RED};border-radius:18px;
-                      display:flex;align-items:center;justify-content:center;
-                      font-size:30px;margin:0 auto 20px;
-                      box-shadow:0 8px 28px rgba(255,68,31,0.28);">🛵</div>
-          <div style="font-size:26px;font-weight:900;color:{TEXT_PRI};
-                      letter-spacing:-0.5px;margin-bottom:12px;">
-            ¿En qué te puedo ayudar?
-          </div>
-          <div style="font-size:13.5px;color:{TEXT_SEC};max-width:500px;
-                      margin:0 auto;line-height:1.75;">
-            Analista operacional con acceso completo a
-            <strong style="color:{TEXT_PRI};">964 zonas</strong>,
-            <strong style="color:{TEXT_PRI};">13 métricas</strong> y
-            <strong style="color:{TEXT_PRI};">9 países LATAM</strong>.<br>
-            Escribe cualquier pregunta — sin necesidad de filtros.
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+    with _chat_area:
 
-        # Category labels + chips
-        _chip_groups = [
-            ("Alertas y deterioro", [
-                "¿Cuáles son las zonas con mayor deterioro SaS esta semana?",
-                "Top zonas con caída en Perfect Orders las últimas 4 semanas",
-            ]),
-            ("Rankings y crecimiento", [
-                "Top 10 zonas con mayor crecimiento de pedidos",
-                "¿Qué país lidera en Perfect Orders esta semana?",
-            ]),
-            ("Comparaciones y análisis", [
-                "Compara Gross Profit UE entre todos los países LATAM",
-                "Oportunidades de mejora en Lead Penetration esta semana",
-            ]),
-        ]
-        for _cat_label, _cat_qs in _chip_groups:
-            st.markdown(
-                f"<p style='font-size:10px;font-weight:700;letter-spacing:1.4px;"
-                f"text-transform:uppercase;color:{TEXT_SEC};margin:16px 0 8px 0;'>"
-                f"{_cat_label}</p>",
-                unsafe_allow_html=True,
-            )
-            st.markdown('<div class="chip-row">', unsafe_allow_html=True)
-            _cc1, _cc2 = st.columns(2)
-            for _ci, _cq in enumerate(_cat_qs):
-                with [_cc1, _cc2][_ci % 2]:
-                    if st.button(_cq, key=f"chip_{abs(hash(_cq)) % 999983}",
-                                 width="stretch", disabled=not api_key_set):
-                        st.session_state._pending_question = _cq
-                        st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
+        if not st.session_state.chat_messages:
+            # ── Welcome state ─────────────────────────────────────────────────
+            st.markdown(f"""
+            <div style="text-align:center;padding:30px 0 20px;user-select:none;">
+              <div style="display:inline-flex;align-items:center;gap:7px;
+                          margin-bottom:10px;">
+                <div style="width:28px;height:28px;background:{RAPPI_RED};border-radius:8px;
+                            display:flex;align-items:center;justify-content:center;
+                            font-size:14px;box-shadow:0 3px 10px rgba(255,68,31,0.22);">🛵</div>
+                <span style="font-size:11px;font-weight:600;color:{TEXT_SEC};
+                             letter-spacing:1.4px;text-transform:uppercase;">Copiloto IA</span>
+              </div>
+              <div style="font-size:22px;font-weight:800;color:{TEXT_PRI};
+                          letter-spacing:-0.5px;line-height:1.25;margin-bottom:7px;">
+                ¿En qué te puedo ayudar?
+              </div>
+              <div style="font-size:12.5px;color:{TEXT_SEC};line-height:1.6;max-width:380px;margin:0 auto;">
+                Pregúntame sobre métricas, zonas, tendencias o pedidos en LATAM
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    else:
-        # ── Append new user message to state BEFORE the container renders ─────
-        # This ensures the for loop inside the container includes the new message,
-        # so user bubble and streaming both happen inside the same fixed container.
-        if user_input:
-            st.session_state.chat_messages.append({"role": "user", "content": user_input})
+            _starter_prompts = [
+                "¿Cuáles son las 10 zonas con mayor Lead Penetration en LATAM esta semana?",
+                "Compara Perfect Orders entre zonas Wealthy y Non Wealthy en Colombia",
+                "Muéstrame la evolución de Turbo Adoption en México en las últimas 8 semanas",
+                "¿Qué zonas High Priority en Brasil tienen mayor caída de Perfect Orders esta semana?",
+                "¿Cuáles son los países con mayor crecimiento de pedidos en las últimas 4 semanas?",
+                "¿Existe correlación entre Perfect Orders y Turbo Adoption a nivel de zona?",
+            ]
+            # Centre the prompt grid with a narrower column pair
+            _pad_l, _grid_c, _pad_r = st.columns([0.5, 9, 0.5])
+            with _grid_c:
+                _sp_col1, _sp_col2 = st.columns(2, gap="small")
+                for i, _sp in enumerate(_starter_prompts):
+                    _col = _sp_col1 if i % 2 == 0 else _sp_col2
+                    with _col:
+                        st.markdown('<div class="starter-prompt">', unsafe_allow_html=True)
+                        st.button(
+                            _sp,
+                            key=f"starter_{i}",
+                            use_container_width=True,
+                            on_click=lambda q=_sp: st.session_state.update({"_pending_question": q}),
+                        )
+                        st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Fixed-height scrollable container (page never grows) ──────────────
-        try:
-            _chat_area = st.container(height=670, border=False)
-        except TypeError:
-            _chat_area = st.container()
-
-        with _chat_area:
-            # History + new user bubble (all inside the container)
+        else:
+            # ── Conversation history ─────────────────────────────────────────
             for msg in st.session_state.chat_messages:
                 _render_history_msg(msg)
 
-            # Stream assistant response INSIDE the same container
+            # ── Stream response for new input ────────────────────────────────
             if user_input:
+                _cur_intent   = detect_question_intent(user_input, metrics_df)
                 context       = build_dynamic_context(metrics_df, orders_df, user_input)
                 system_prompt = load_system_prompt()
 
                 with st.chat_message("assistant", avatar="🛵"):
                     response_ph = st.empty()
                     response_ph.markdown(
-                        f"<span style='color:{TEXT_SEC};font-size:13px;font-style:italic;'>"
-                        "Analizando datos operativos…</span>",
+                        f"<span style='color:{TEXT_SEC};font-size:13px;"
+                        "font-style:italic;'>Analizando datos operativos…</span>",
                         unsafe_allow_html=True,
                     )
                     full_text  = ""
@@ -1233,30 +1539,36 @@ with tab_chat:
                         response_ph.markdown(body)
 
                         chart_spec = parse_chart_spec(full_text)
-                        if chart_spec:
-                            fig = render_chart_from_spec(
+                        _new_fig = compute_intent_chart(
+                            metrics_df, orders_df, _cur_intent, user_input
+                        )
+                        if _new_fig is None and chart_spec:
+                            _new_fig = render_chart_from_spec(
                                 chart_spec, metrics_df, orders_df, None, compact=True
                             )
-                            if fig:
-                                col_c, _ = st.columns([3, 1])
-                                with col_c:
-                                    st.plotly_chart(fig, width="stretch")
+                        if _new_fig:
+                            _cc, _ = st.columns([5, 3])
+                            with _cc:
+                                st.plotly_chart(_new_fig, use_container_width=True)
 
                         if suggestion and api_key_set:
+                            _fu_key_new = f"fu_new_{abs(hash(suggestion)) % 999983}"
                             st.markdown('<div class="followup">', unsafe_allow_html=True)
-                            if st.button(
+                            st.button(
                                 f"💡  {suggestion}",
-                                key=f"fu_new_{abs(hash(suggestion)) % 999983}",
-                            ):
-                                st.session_state._pending_question = suggestion
+                                key=_fu_key_new,
+                                on_click=lambda q=suggestion: st.session_state.update(
+                                    {"_pending_question": q}
+                                ),
+                            )
                             st.markdown('</div>', unsafe_allow_html=True)
 
+                    except RateLimitError:
+                        error_text = "El copiloto no está disponible en este momento. Intenta de nuevo en unos minutos."
                     except AuthError:
-                        error_text = "Clave API inválida. Verifica la clave del proveedor."
+                        error_text = "Clave API inválida. Verifica la configuración."
                     except NetworkError:
                         error_text = "Sin conexión con la API. Verifica tu red."
-                    except RateLimitError:
-                        error_text = "Límite de tasa. Espera un momento e intenta de nuevo."
                     except ProviderError as exc:
                         error_text = f"Error del proveedor: {exc}"
                     except Exception as exc:
@@ -1265,35 +1577,62 @@ with tab_chat:
                     if error_text:
                         response_ph.error(error_text)
 
-                # Save assistant to state (user was already saved before the container)
                 if not error_text:
                     stored   = strip_chart_block(full_text)
                     spec_out = parse_chart_spec(full_text)
                     st.session_state.chat_messages.append({
-                        "role": "assistant",
-                        "content": stored,
-                        "chart_spec": spec_out,
+                        "role":          "assistant",
+                        "content":       stored,
+                        "chart_spec":    spec_out,
+                        "user_question": user_input,
                     })
                     st.session_state.api_history.append({"role": "user",      "content": user_input})
                     body_only, _ = extract_suggested_question(stored)
                     st.session_state.api_history.append({"role": "assistant", "content": body_only})
 
-            # Anchor at end of container content — JS scrolls to this
             st.markdown('<div id="chat-scroll-anchor"></div>', unsafe_allow_html=True)
 
-    # ── Scroll container to latest message (targets internal anchor) ──────────
-    components.html("""<script>
-    (function() {
-        var a = window.parent.document.getElementById('chat-scroll-anchor');
-        if (a) a.scrollIntoView({block: 'end'});
-    })();
+    # Fix scroll + keep input fixed at viewport bottom
+    components.html(f"""<script>
+    (function() {{
+        var doc = window.parent.document;
+
+        function fixChatLayout() {{
+            // stMain overflow is controlled by CSS (no JS inline-style mutations).
+            // Only responsibility here: pin the chat input and scroll to latest message.
+
+            // stChatFloatingInputContainer lives inside stBottom inside the overflow:hidden
+            // stMain — position:fixed extracts it to viewport coordinates so it's visible.
+            var chatInput = doc.querySelector('.stChatFloatingInputContainer');
+            var sidebar   = doc.querySelector('[data-testid="stSidebar"]');
+            if (chatInput) {{
+                var sidebarRight = (sidebar && sidebar.offsetWidth) ? sidebar.getBoundingClientRect().right : 0;
+                chatInput.style.position = 'fixed';
+                chatInput.style.bottom   = '0';
+                chatInput.style.left     = sidebarRight + 'px';
+                chatInput.style.right    = '0';
+                chatInput.style.zIndex   = '1000';
+            }}
+
+            // Scroll the internal chat-history container to the latest message
+            var anchor = doc.getElementById('chat-scroll-anchor');
+            if (anchor) anchor.scrollIntoView({{block: 'end'}});
+        }}
+
+        fixChatLayout();
+        setTimeout(fixChatLayout, 150);
+
+        var sidebar = doc.querySelector('[data-testid="stSidebar"]');
+        if (sidebar) new ResizeObserver(fixChatLayout).observe(sidebar);
+        window.parent.addEventListener('resize', fixChatLayout);
+    }})();
     </script>""", height=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 6 · Datos
+# PAGE · Datos
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_data:
+if _page == "Datos":
     sheet = st.radio("Hoja", ["RAW_INPUT_METRICS", "RAW_ORDERS"], horizontal=True)
     raw = metrics_df if sheet == "RAW_INPUT_METRICS" else orders_df
 
