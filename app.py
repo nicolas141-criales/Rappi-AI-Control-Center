@@ -107,8 +107,8 @@ html, body {{
 
 /* ── Layout ── */
 .main .block-container {{
-    padding: 0.5rem 2rem 1rem 2rem !important;
-    max-width: 1480px !important;
+    padding: 0.5rem 1.25rem 0 1.25rem !important;
+    max-width: 100% !important;
     height: 100dvh !important;
     box-sizing: border-box !important;
     overflow-y: auto !important;
@@ -185,7 +185,15 @@ section[data-testid="stSidebar"] .stButton {{
     margin-top: 0 !important;
 }}
 
-/* ── Sidebar ── */
+/* ── Sidebar — narrower to give content more space ── */
+section[data-testid="stSidebar"] {{
+    min-width: 210px !important;
+    max-width: 210px !important;
+    width:     210px !important;
+}}
+section[data-testid="stSidebar"] > div {{
+    width: 210px !important;
+}}
 section[data-testid="stSidebar"] > div:first-child {{
     background: {DARK_NAV} !important;
 }}
@@ -1208,140 +1216,245 @@ if _page == "Copiloto IA":
     # ── Chat-specific CSS ─────────────────────────────────────────────────────
     st.markdown(f"""
     <style>
-    /* stMain must stay locked on the chat page — scroll is handled by
-       st.container(height=540) for history and a JS-fixed chat input.
-       Explicit override in case Insights CSS residue affects this page. */
-    [data-testid="stMain"] {{
+    /* ── FLEX CHAIN: every ancestor shrinks, only the message div scrolls ── */
+    html, body {{
+        height: 100dvh !important;
         overflow: hidden !important;
     }}
-    [data-testid="stMainBlockContainer"],
-    .main .block-container {{
+    [data-testid="stApp"] {{
         height: 100dvh !important;
-        overflow-y: hidden !important;
-        padding-bottom: 0 !important;
+        overflow: hidden !important;
+        display: flex !important;
+        flex-direction: column !important;
     }}
-    /* User bubble */
-    .umsg {{ display:flex; justify-content:flex-end; margin:3px 0 3px 20%; }}
+    [data-testid="stAppViewContainer"] {{
+        flex: 1 1 0% !important;
+        min-height: 0 !important;
+        display: flex !important;
+        flex-direction: row !important;
+    }}
+    [data-testid="stMain"] {{
+        flex: 1 1 0% !important;
+        min-height: 0 !important;
+        min-width: 0 !important;
+        display: flex !important;
+        flex-direction: column !important;
+        overflow: hidden !important;
+    }}
+    [data-testid="stMainBlockContainer"] {{
+        flex: 1 1 0% !important;
+        min-height: 0 !important;
+        display: flex !important;
+        flex-direction: column !important;
+        overflow: hidden !important;
+        padding-top: 0.4rem !important;
+        padding-bottom: 0 !important;
+        max-width: 100% !important;
+    }}
+    .main .block-container {{
+        flex: 1 1 0% !important;
+        min-height: 0 !important;
+        display: flex !important;
+        flex-direction: column !important;
+        overflow: hidden !important;
+        padding-top: 0.4rem !important;
+        padding-bottom: 0 !important;
+        max-width: 100% !important;
+    }}
+    /* ── SCROLL CONTAINER ──
+       The outer stVerticalBlock (direct child of .block-container) is the ONLY
+       scroll container. Messages render inside it directly — no st.container()
+       wrapper. JS refines the height precisely after paint.                    */
+    .main .block-container > [data-testid="stVerticalBlock"] {{
+        height: calc(100dvh - 100px) !important;
+        max-height: calc(100dvh - 100px) !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+        padding-bottom: 100px !important;
+        box-sizing: border-box !important;
+        /* DEBUG — remove after confirming scroll works */
+        outline: 2px solid red !important;
+        background: rgba(255, 0, 0, 0.04) !important;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(0,0,0,0.10) transparent;
+    }}
+    .main .block-container > [data-testid="stVerticalBlock"]::-webkit-scrollbar {{ width: 5px; }}
+    .main .block-container > [data-testid="stVerticalBlock"]::-webkit-scrollbar-track {{ background: transparent; }}
+    .main .block-container > [data-testid="stVerticalBlock"]::-webkit-scrollbar-thumb {{
+        background: rgba(0,0,0,0.14); border-radius: 3px;
+    }}
+    /* All nested stVerticalBlocks grow freely — tables, charts, markdown don't clip */
+    .main .block-container > [data-testid="stVerticalBlock"] [data-testid="stVerticalBlock"] {{
+        overflow: visible !important;
+        height: auto !important;
+        min-height: 0 !important;
+    }}
+
+    /* ── User bubble — wide, right-aligned ── */
+    .umsg {{
+        display: flex;
+        justify-content: flex-end;
+        margin: 5px 0 5px 8%;
+    }}
     .ububble {{
         background: {RAPPI_RED};
         color: #FFFFFF;
-        border-radius: 18px 18px 4px 18px;
-        padding: 9px 14px;
-        font-size: 13.5px;
-        line-height: 1.55;
+        border-radius: 20px 20px 4px 20px;
+        padding: 11px 17px;
+        font-size: 14px;
+        line-height: 1.6;
         word-break: break-word;
-        box-shadow: 0 2px 6px rgba(255,68,31,0.25);
+        overflow-wrap: break-word;
+        max-width: 86%;
+        box-shadow: 0 3px 10px rgba(255,68,31,0.22);
     }}
-    /* Assistant message — tight spacing */
+
+    /* ── Assistant message — wide, full-wrap ── */
     [data-testid="stChatMessage"] {{
-        margin: 2px 15% 2px 0 !important;
-        gap: 8px !important;
+        margin: 5px 3% 5px 0 !important;
+        gap: 10px !important;
+        max-width: 97% !important;
+        align-items: flex-start !important;
     }}
     [data-testid="stChatMessageContent"] {{
         background: #FFFFFF !important;
-        border: 1px solid #EDF0F8 !important;
-        border-radius: 4px 18px 18px 18px !important;
-        padding: 10px 14px 8px !important;
-        box-shadow: 0 1px 3px rgba(28,28,40,0.08) !important;
+        border: 1px solid #EAECF4 !important;
+        border-radius: 4px 20px 20px 20px !important;
+        padding: 13px 18px 11px !important;
+        box-shadow: 0 2px 8px rgba(28,28,40,0.06) !important;
+        overflow-wrap: break-word !important;
+        word-break: break-word !important;
+        width: 100% !important;
     }}
     [data-testid="stChatMessageContent"] p {{
-        font-size: 13.5px !important;
-        line-height: 1.65 !important;
-        margin-bottom: 6px !important;
+        font-size: 14px !important;
+        line-height: 1.7 !important;
+        margin-bottom: 8px !important;
         color: {TEXT_PRI} !important;
+        overflow-wrap: break-word !important;
     }}
     [data-testid="stChatMessageContent"] strong {{
         font-weight: 700 !important;
         color: {TEXT_PRI} !important;
     }}
     [data-testid="stChatMessageContent"] li {{
-        font-size: 13.5px !important;
-        line-height: 1.6 !important;
+        font-size: 14px !important;
+        line-height: 1.65 !important;
         color: {TEXT_PRI} !important;
+        margin-bottom: 4px !important;
     }}
     [data-testid="stChatMessageContent"] h1,
     [data-testid="stChatMessageContent"] h2,
     [data-testid="stChatMessageContent"] h3 {{
-        font-size: 14px !important;
+        font-size: 15px !important;
         font-weight: 700 !important;
-        margin: 10px 0 4px !important;
+        margin: 14px 0 6px !important;
         color: {TEXT_PRI} !important;
     }}
-    /* Chat input — minimal, ChatGPT-like */
+    [data-testid="stChatMessageContent"] code {{
+        font-size: 12.5px !important;
+        background: #F4F5F7 !important;
+        padding: 2px 7px !important;
+        border-radius: 5px !important;
+    }}
+    [data-testid="stChatMessageContent"] table {{
+        font-size: 13px !important;
+        width: 100% !important;
+        border-collapse: collapse !important;
+    }}
+    [data-testid="stChatMessageContent"] th,
+    [data-testid="stChatMessageContent"] td {{
+        padding: 6px 10px !important;
+        border-bottom: 1px solid {BORDER} !important;
+    }}
+    /* Charts inside bubbles: full width */
+    [data-testid="stChatMessageContent"] [data-testid="stPlotlyChart"],
+    [data-testid="stChatMessageContent"] .stPlotlyChart,
+    [data-testid="stChatMessageContent"] [data-testid="element-container"] {{
+        width: 100% !important;
+    }}
+
+    /* ── Chat input — full width, pinned bottom, ChatGPT style ── */
     .stChatFloatingInputContainer {{
         border-top: none !important;
-        background: linear-gradient(to top, {PAGE_BG} 62%, rgba(245,246,250,0)) !important;
-        padding: 0 max(16px, calc(50% - 380px)) 18px !important;
+        background: linear-gradient(to top, {PAGE_BG} 72%, rgba(245,246,250,0)) !important;
+        padding: 0 20px 18px !important;
+        box-sizing: border-box !important;
     }}
     .stChatFloatingInputContainer textarea {{
-        font-size: 14px !important;
-        border-radius: 26px !important;
-        border: 1px solid rgba(228,232,240,0.9) !important;
+        font-size: 14.5px !important;
+        border-radius: 28px !important;
+        border: 1.5px solid rgba(220,225,238,0.95) !important;
         background: #FFFFFF !important;
-        box-shadow: 0 2px 16px rgba(28,28,40,0.09) !important;
-        padding-left: 20px !important;
-        line-height: 1.5 !important;
+        box-shadow: 0 4px 22px rgba(28,28,40,0.08) !important;
+        padding: 13px 22px !important;
+        line-height: 1.55 !important;
+        min-height: 52px !important;
         transition: box-shadow 0.18s, border-color 0.18s !important;
     }}
     .stChatFloatingInputContainer textarea:focus {{
-        border-color: rgba(255,68,31,0.30) !important;
-        box-shadow: 0 2px 16px rgba(28,28,40,0.09), 0 0 0 3px rgba(255,68,31,0.08) !important;
+        border-color: rgba(255,68,31,0.38) !important;
+        box-shadow: 0 4px 22px rgba(28,28,40,0.10), 0 0 0 3px rgba(255,68,31,0.09) !important;
         outline: none !important;
     }}
-    /* Follow-up suggestion chip */
+
+    /* ── Follow-up suggestion chip ── */
     .followup .stButton > button {{
         background: #EFF6FF;
         border: 1.5px solid #BFDBFE;
         border-radius: 100px;
         color: #1D4ED8;
-        font-size: 12px;
+        font-size: 13px;
         font-weight: 500;
-        padding: 7px 15px;
+        padding: 8px 16px;
         height: auto;
-        min-height: 34px;
+        min-height: 36px;
         white-space: normal;
-        line-height: 1.4;
+        line-height: 1.45;
         text-align: left;
+        margin-top: 6px;
     }}
     .followup .stButton > button:hover {{
         background: #DBEAFE;
         border-color: #3B82F6;
         color: #1E40AF;
     }}
-    /* Starter prompt chips — light, conversational */
+
+    /* ── Starter prompt chips ── */
     .starter-prompt .stButton > button {{
-        background: rgba(255,255,255,0.72);
-        border: 1px solid rgba(228,232,240,0.75);
-        border-radius: 12px;
+        background: rgba(255,255,255,0.78);
+        border: 1px solid rgba(220,225,238,0.85);
+        border-radius: 10px;
         color: {TEXT_SEC};
-        font-size: 12px;
+        font-size: 12.5px;
         font-weight: 400;
-        padding: 9px 14px;
+        padding: 7px 12px;
         height: auto;
-        min-height: 44px;
+        min-height: 36px;
         white-space: normal;
-        line-height: 1.45;
+        line-height: 1.4;
         text-align: left;
         box-shadow: none;
         transition: border-color 0.15s, box-shadow 0.15s, color 0.15s, background 0.15s;
     }}
     .starter-prompt .stButton > button:hover {{
         background: #FFFFFF;
-        border-color: rgba(255,68,31,0.35);
+        border-color: rgba(255,68,31,0.40);
         box-shadow: 0 2px 10px rgba(255,68,31,0.10);
         color: {TEXT_PRI};
     }}
-    /* Inline export pills */
+
+    /* ── Inline export pills ── */
     .chat-ex-btn {{
         display: inline-flex;
         align-items: center;
         gap: 5px;
-        padding: 5px 13px;
+        padding: 6px 15px;
         background: transparent;
         border: 1px solid {BORDER};
         border-radius: 100px;
         color: {TEXT_SEC};
-        font-size: 11.5px;
+        font-size: 12px;
         font-weight: 500;
         text-decoration: none;
         transition: border-color 0.15s, color 0.15s, background 0.15s;
@@ -1353,6 +1466,79 @@ if _page == "Copiloto IA":
         color: {RAPPI_RED};
         background: rgba(255,68,31,0.04);
         text-decoration: none;
+    }}
+
+    /* ── COLLAPSE EMPTY WRAPPERS ─────────────────────────────────────────────
+       Streamlit emits wrapper divs for every conditional block even when the
+       block renders nothing. They carry emotion-cache padding/min-height and
+       create visible blank space. Targets below zero them out safely.         */
+
+    /* element-container: wraps every st.xxx() output; empty = nothing rendered */
+    .element-container:empty {{
+        display: none !important;
+    }}
+
+    /* stVerticalBlock: Streamlit's column/row container; empty = unused branch */
+    [data-testid="stVerticalBlock"]:empty {{
+        display: none !important;
+    }}
+
+    /* stVerticalBlockBorderWrapper: from st.container(height=N) if any remain */
+    [data-testid="stVerticalBlockBorderWrapper"]:empty,
+    [data-testid="stVerticalBlockBorderWrapper"] > div:empty {{
+        display: none !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }}
+
+    /* stCustomComponent: wrapper around components.html(); height:0 iframe
+       but the surrounding div keeps its own padding unless zeroed here        */
+    [data-testid="stCustomComponent"] {{
+        height: 0 !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        overflow: hidden !important;
+    }}
+
+    /* Catch any leftover emotion-cache div that is truly empty inside scroll area */
+    .main .block-container > [data-testid="stVerticalBlock"] > div:empty {{
+        height: 0 !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }}
+
+    /* Streamlit sometimes injects stSpacer or stHeading wrappers as placeholders */
+    [data-testid="stSpacer"] {{
+        display: none !important;
+    }}
+
+    /* ── components.html(height=0) iframe wrapper ────────────────────────────
+       eqt0gmo8 is the emotion hash for this specific wrapper div. It contains
+       a height:0 iframe so :empty doesn't match it. Zero it directly.
+       The structural fallback (iframe[height="0"]) handles future version changes. */
+    .eqt0gmo8 {{
+        height: 0 !important;
+        min-height: 0 !important;
+        max-height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        overflow: hidden !important;
+    }}
+    iframe[height="0"],
+    iframe[height="0px"] {{
+        display: none !important;
+    }}
+    /* Structural fallback: any direct child of stCustomComponent that only wraps a hidden iframe */
+    [data-testid="stCustomComponent"] > div {{
+        height: 0 !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        overflow: hidden !important;
     }}
     </style>
     """, unsafe_allow_html=True)
@@ -1384,9 +1570,7 @@ if _page == "Copiloto IA":
                         msg["chart_spec"], metrics_df, orders_df, None, compact=True
                     )
                 if _hist_fig:
-                    _cc, _ = st.columns([5, 3])
-                    with _cc:
-                        st.plotly_chart(_hist_fig, use_container_width=True)
+                    st.plotly_chart(_hist_fig, use_container_width=True)
                 if suggestion and api_key_set:
                     _fu_key = f"fu_{abs(hash(suggestion + body[:20])) % 999983}"
                     st.markdown('<div class="followup">', unsafe_allow_html=True)
@@ -1399,13 +1583,156 @@ if _page == "Copiloto IA":
                     )
                     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── 1. Reserve history slot FIRST — this anchors it above everything below ──
-    try:
-        _chat_area = st.container(height=540, border=False)
-    except TypeError:
-        _chat_area = st.container()
+    # ── 1. Capture user input (renders as fixed floating bar regardless of DOM pos) ──
+    pending    = st.session_state.pop("_pending_question", None)
+    user_input = st.chat_input(
+        "Pregunta sobre operaciones Rappi...",
+        disabled=not api_key_set,
+    ) or pending
 
-    # ── 2. Inline export bar — only when conversation has AI responses ────────
+    if user_input:
+        st.session_state.chat_messages.append({"role": "user", "content": user_input})
+
+    # ── 2. Messages rendered DIRECTLY into the outer stVerticalBlock ──────────
+    #    That element is the scroll container (CSS + JS both target it).
+    #    No st.container() wrapper — messages are direct children.
+    if not st.session_state.chat_messages:
+        # ── Welcome state ──────────────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="text-align:center;padding:30px 0 20px;user-select:none;">
+          <div style="display:inline-flex;align-items:center;gap:7px;
+                      margin-bottom:10px;">
+            <div style="width:28px;height:28px;background:{RAPPI_RED};border-radius:8px;
+                        display:flex;align-items:center;justify-content:center;
+                        font-size:14px;box-shadow:0 3px 10px rgba(255,68,31,0.22);">🛵</div>
+            <span style="font-size:11px;font-weight:600;color:{TEXT_SEC};
+                         letter-spacing:1.4px;text-transform:uppercase;">Copiloto IA</span>
+          </div>
+          <div style="font-size:22px;font-weight:800;color:{TEXT_PRI};
+                      letter-spacing:-0.5px;line-height:1.25;margin-bottom:7px;">
+            ¿En qué te puedo ayudar?
+          </div>
+          <div style="font-size:12.5px;color:{TEXT_SEC};line-height:1.6;max-width:380px;margin:0 auto;">
+            Pregúntame sobre métricas, zonas, tendencias o pedidos en LATAM
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        _starter_prompts = [
+            "¿Cuáles son las 10 zonas con mayor Lead Penetration en LATAM esta semana?",
+            "Compara Perfect Orders entre zonas Wealthy y Non Wealthy en Colombia",
+            "Muéstrame la evolución de Turbo Adoption en México en las últimas 8 semanas",
+            "¿Qué zonas High Priority en Brasil tienen mayor caída de Perfect Orders esta semana?",
+            "¿Cuáles son los países con mayor crecimiento de pedidos en las últimas 4 semanas?",
+            "¿Existe correlación entre Perfect Orders y Turbo Adoption a nivel de zona?",
+        ]
+        _pad_l, _grid_c, _pad_r = st.columns([0.5, 9, 0.5])
+        with _grid_c:
+            _sp_col1, _sp_col2 = st.columns(2, gap="small")
+            for i, _sp in enumerate(_starter_prompts):
+                _col = _sp_col1 if i % 2 == 0 else _sp_col2
+                with _col:
+                    st.markdown('<div class="starter-prompt">', unsafe_allow_html=True)
+                    st.button(
+                        _sp,
+                        key=f"starter_{i}",
+                        use_container_width=True,
+                        on_click=lambda q=_sp: st.session_state.update({"_pending_question": q}),
+                    )
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+    else:
+        # ── Conversation history ───────────────────────────────────────────────
+        for msg in st.session_state.chat_messages:
+            _render_history_msg(msg)
+
+        # ── Stream response for new input ─────────────────────────────────────
+        if user_input:
+            _cur_intent   = detect_question_intent(user_input, metrics_df)
+            context       = build_dynamic_context(metrics_df, orders_df, user_input)
+            system_prompt = load_system_prompt()
+
+            with st.chat_message("assistant", avatar="🛵"):
+                response_ph = st.empty()
+                response_ph.markdown(
+                    f"<span style='color:{TEXT_SEC};font-size:13px;"
+                    "font-style:italic;'>Analizando datos operativos…</span>",
+                    unsafe_allow_html=True,
+                )
+                full_text  = ""
+                error_text = None
+
+                try:
+                    for chunk in stream_response(
+                        user_input, context, st.session_state.api_history,
+                        system_prompt, provider=ai_provider,
+                    ):
+                        full_text += chunk
+                        display = re.sub(r"```chart.*?```", "", full_text, flags=re.DOTALL)
+                        display = re.sub(r"```chart[^`]*$", "", display, flags=re.DOTALL)
+                        display = re.sub(
+                            r"\*\*Pregunta\s+sugerida:\*\*.*", "", display,
+                            flags=re.DOTALL | re.IGNORECASE,
+                        ).strip()
+                        response_ph.markdown(display + " ▌")
+
+                    clean = strip_chart_block(full_text)
+                    body, suggestion = extract_suggested_question(clean)
+                    response_ph.markdown(body)
+
+                    chart_spec = parse_chart_spec(full_text)
+                    _new_fig = compute_intent_chart(
+                        metrics_df, orders_df, _cur_intent, user_input
+                    )
+                    if _new_fig is None and chart_spec:
+                        _new_fig = render_chart_from_spec(
+                            chart_spec, metrics_df, orders_df, None, compact=True
+                        )
+                    if _new_fig:
+                        st.plotly_chart(_new_fig, use_container_width=True)
+
+                    if suggestion and api_key_set:
+                        _fu_key_new = f"fu_new_{abs(hash(suggestion)) % 999983}"
+                        st.markdown('<div class="followup">', unsafe_allow_html=True)
+                        st.button(
+                            f"💡  {suggestion}",
+                            key=_fu_key_new,
+                            on_click=lambda q=suggestion: st.session_state.update(
+                                {"_pending_question": q}
+                            ),
+                        )
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+                except RateLimitError:
+                    error_text = "El copiloto no está disponible en este momento. Intenta de nuevo en unos minutos."
+                except AuthError:
+                    error_text = "Clave API inválida. Verifica la configuración."
+                except NetworkError:
+                    error_text = "Sin conexión con la API. Verifica tu red."
+                except ProviderError as exc:
+                    error_text = f"Error del proveedor: {exc}"
+                except Exception as exc:
+                    error_text = f"Error inesperado: {exc}"
+
+                if error_text:
+                    response_ph.error(error_text)
+
+            if not error_text:
+                stored   = strip_chart_block(full_text)
+                spec_out = parse_chart_spec(full_text)
+                st.session_state.chat_messages.append({
+                    "role":          "assistant",
+                    "content":       stored,
+                    "chart_spec":    spec_out,
+                    "user_question": user_input,
+                })
+                st.session_state.api_history.append({"role": "user",      "content": user_input})
+                body_only, _ = extract_suggested_question(stored)
+                st.session_state.api_history.append({"role": "assistant", "content": body_only})
+
+        st.markdown('<div id="chat-scroll-anchor"></div>', unsafe_allow_html=True)
+
+    # ── 3. Inline export bar (scrolls with messages) ──────────────────────────
     _chat_msgs = st.session_state.get("chat_messages", [])
     if any(m["role"] == "assistant" for m in _chat_msgs):
         _ex_csv_b64 = _ex_pdf_b64 = ""
@@ -1440,192 +1767,70 @@ if _page == "Copiloto IA":
                 unsafe_allow_html=True,
             )
 
-    # ── 3. Input renders here in DOM = BELOW the history slot ─────────────────
-    pending    = st.session_state.pop("_pending_question", None)
-    user_input = st.chat_input(
-        "Pregunta sobre operaciones Rappi...",
-        disabled=not api_key_set,
-    ) or pending
-
-    # ── 4. Append new message to state, then fill the history slot ────────────
-    if user_input:
-        st.session_state.chat_messages.append({"role": "user", "content": user_input})
-
-    with _chat_area:
-
-        if not st.session_state.chat_messages:
-            # ── Welcome state ─────────────────────────────────────────────────
-            st.markdown(f"""
-            <div style="text-align:center;padding:30px 0 20px;user-select:none;">
-              <div style="display:inline-flex;align-items:center;gap:7px;
-                          margin-bottom:10px;">
-                <div style="width:28px;height:28px;background:{RAPPI_RED};border-radius:8px;
-                            display:flex;align-items:center;justify-content:center;
-                            font-size:14px;box-shadow:0 3px 10px rgba(255,68,31,0.22);">🛵</div>
-                <span style="font-size:11px;font-weight:600;color:{TEXT_SEC};
-                             letter-spacing:1.4px;text-transform:uppercase;">Copiloto IA</span>
-              </div>
-              <div style="font-size:22px;font-weight:800;color:{TEXT_PRI};
-                          letter-spacing:-0.5px;line-height:1.25;margin-bottom:7px;">
-                ¿En qué te puedo ayudar?
-              </div>
-              <div style="font-size:12.5px;color:{TEXT_SEC};line-height:1.6;max-width:380px;margin:0 auto;">
-                Pregúntame sobre métricas, zonas, tendencias o pedidos en LATAM
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            _starter_prompts = [
-                "¿Cuáles son las 10 zonas con mayor Lead Penetration en LATAM esta semana?",
-                "Compara Perfect Orders entre zonas Wealthy y Non Wealthy en Colombia",
-                "Muéstrame la evolución de Turbo Adoption en México en las últimas 8 semanas",
-                "¿Qué zonas High Priority en Brasil tienen mayor caída de Perfect Orders esta semana?",
-                "¿Cuáles son los países con mayor crecimiento de pedidos en las últimas 4 semanas?",
-                "¿Existe correlación entre Perfect Orders y Turbo Adoption a nivel de zona?",
-            ]
-            # Centre the prompt grid with a narrower column pair
-            _pad_l, _grid_c, _pad_r = st.columns([0.5, 9, 0.5])
-            with _grid_c:
-                _sp_col1, _sp_col2 = st.columns(2, gap="small")
-                for i, _sp in enumerate(_starter_prompts):
-                    _col = _sp_col1 if i % 2 == 0 else _sp_col2
-                    with _col:
-                        st.markdown('<div class="starter-prompt">', unsafe_allow_html=True)
-                        st.button(
-                            _sp,
-                            key=f"starter_{i}",
-                            use_container_width=True,
-                            on_click=lambda q=_sp: st.session_state.update({"_pending_question": q}),
-                        )
-                        st.markdown('</div>', unsafe_allow_html=True)
-
-        else:
-            # ── Conversation history ─────────────────────────────────────────
-            for msg in st.session_state.chat_messages:
-                _render_history_msg(msg)
-
-            # ── Stream response for new input ────────────────────────────────
-            if user_input:
-                _cur_intent   = detect_question_intent(user_input, metrics_df)
-                context       = build_dynamic_context(metrics_df, orders_df, user_input)
-                system_prompt = load_system_prompt()
-
-                with st.chat_message("assistant", avatar="🛵"):
-                    response_ph = st.empty()
-                    response_ph.markdown(
-                        f"<span style='color:{TEXT_SEC};font-size:13px;"
-                        "font-style:italic;'>Analizando datos operativos…</span>",
-                        unsafe_allow_html=True,
-                    )
-                    full_text  = ""
-                    error_text = None
-
-                    try:
-                        for chunk in stream_response(
-                            user_input, context, st.session_state.api_history,
-                            system_prompt, provider=ai_provider,
-                        ):
-                            full_text += chunk
-                            display = re.sub(r"```chart.*?```", "", full_text, flags=re.DOTALL)
-                            display = re.sub(r"```chart[^`]*$", "", display, flags=re.DOTALL)
-                            display = re.sub(
-                                r"\*\*Pregunta\s+sugerida:\*\*.*", "", display,
-                                flags=re.DOTALL | re.IGNORECASE,
-                            ).strip()
-                            response_ph.markdown(display + " ▌")
-
-                        clean = strip_chart_block(full_text)
-                        body, suggestion = extract_suggested_question(clean)
-                        response_ph.markdown(body)
-
-                        chart_spec = parse_chart_spec(full_text)
-                        _new_fig = compute_intent_chart(
-                            metrics_df, orders_df, _cur_intent, user_input
-                        )
-                        if _new_fig is None and chart_spec:
-                            _new_fig = render_chart_from_spec(
-                                chart_spec, metrics_df, orders_df, None, compact=True
-                            )
-                        if _new_fig:
-                            _cc, _ = st.columns([5, 3])
-                            with _cc:
-                                st.plotly_chart(_new_fig, use_container_width=True)
-
-                        if suggestion and api_key_set:
-                            _fu_key_new = f"fu_new_{abs(hash(suggestion)) % 999983}"
-                            st.markdown('<div class="followup">', unsafe_allow_html=True)
-                            st.button(
-                                f"💡  {suggestion}",
-                                key=_fu_key_new,
-                                on_click=lambda q=suggestion: st.session_state.update(
-                                    {"_pending_question": q}
-                                ),
-                            )
-                            st.markdown('</div>', unsafe_allow_html=True)
-
-                    except RateLimitError:
-                        error_text = "El copiloto no está disponible en este momento. Intenta de nuevo en unos minutos."
-                    except AuthError:
-                        error_text = "Clave API inválida. Verifica la configuración."
-                    except NetworkError:
-                        error_text = "Sin conexión con la API. Verifica tu red."
-                    except ProviderError as exc:
-                        error_text = f"Error del proveedor: {exc}"
-                    except Exception as exc:
-                        error_text = f"Error inesperado: {exc}"
-
-                    if error_text:
-                        response_ph.error(error_text)
-
-                if not error_text:
-                    stored   = strip_chart_block(full_text)
-                    spec_out = parse_chart_spec(full_text)
-                    st.session_state.chat_messages.append({
-                        "role":          "assistant",
-                        "content":       stored,
-                        "chart_spec":    spec_out,
-                        "user_question": user_input,
-                    })
-                    st.session_state.api_history.append({"role": "user",      "content": user_input})
-                    body_only, _ = extract_suggested_question(stored)
-                    st.session_state.api_history.append({"role": "assistant", "content": body_only})
-
-            st.markdown('<div id="chat-scroll-anchor"></div>', unsafe_allow_html=True)
-
-    # Fix scroll + keep input fixed at viewport bottom
-    components.html(f"""<script>
-    (function() {{
+    # JS: pin input + set precise height on the outer stVerticalBlock (the scroll
+    # container). setProperty with 'important' wins over CSS !important.
+    components.html("""<script>
+    (function() {
         var doc = window.parent.document;
+        var win = window.parent;
 
-        function fixChatLayout() {{
-            // stMain overflow is controlled by CSS (no JS inline-style mutations).
-            // Only responsibility here: pin the chat input and scroll to latest message.
+        function getScrollEl() {
+            // The outer stVerticalBlock is the direct child of .block-container.
+            // It is the scroll container — messages render directly inside it.
+            var bc = doc.querySelector('[data-testid="stMainBlockContainer"]');
+            if (!bc) return null;
+            // Walk children until we find a stVerticalBlock
+            var kids = bc.children;
+            for (var i = 0; i < kids.length; i++) {
+                if (kids[i].getAttribute('data-testid') === 'stVerticalBlock') {
+                    return kids[i];
+                }
+            }
+            // Fallback: first child of block-container's first div child
+            var inner = bc.firstElementChild;
+            return inner ? inner.querySelector('[data-testid="stVerticalBlock"]') : null;
+        }
 
-            // stChatFloatingInputContainer lives inside stBottom inside the overflow:hidden
-            // stMain — position:fixed extracts it to viewport coordinates so it's visible.
+        function fixChatLayout() {
             var chatInput = doc.querySelector('.stChatFloatingInputContainer');
             var sidebar   = doc.querySelector('[data-testid="stSidebar"]');
-            if (chatInput) {{
-                var sidebarRight = (sidebar && sidebar.offsetWidth) ? sidebar.getBoundingClientRect().right : 0;
-                chatInput.style.position = 'fixed';
-                chatInput.style.bottom   = '0';
-                chatInput.style.left     = sidebarRight + 'px';
-                chatInput.style.right    = '0';
-                chatInput.style.zIndex   = '1000';
-            }}
 
-            // Scroll the internal chat-history container to the latest message
-            var anchor = doc.getElementById('chat-scroll-anchor');
-            if (anchor) anchor.scrollIntoView({{block: 'end'}});
-        }}
+            // 1. Pin input to viewport bottom
+            if (chatInput) {
+                var sr = sidebar
+                    ? Math.max(sidebar.getBoundingClientRect().right, 0) : 0;
+                chatInput.style.setProperty('position', 'fixed',  'important');
+                chatInput.style.setProperty('bottom',   '0',      'important');
+                chatInput.style.setProperty('left',     sr + 'px','important');
+                chatInput.style.setProperty('right',    '0',      'important');
+                chatInput.style.setProperty('z-index',  '1000',   'important');
+            }
+
+            // 2. Set precise height on the scroll container
+            var scrollEl = getScrollEl();
+            if (scrollEl) {
+                var top    = scrollEl.getBoundingClientRect().top;
+                var inputH = chatInput
+                    ? Math.max(chatInput.getBoundingClientRect().height, 60) : 90;
+                var avail  = Math.floor(win.innerHeight - top - inputH - 8);
+                if (avail > 80) {
+                    scrollEl.style.setProperty('height',     avail + 'px', 'important');
+                    scrollEl.style.setProperty('max-height', avail + 'px', 'important');
+                    scrollEl.style.setProperty('overflow-y', 'auto',       'important');
+                    scrollEl.style.setProperty('overflow-x', 'hidden',     'important');
+                }
+                // 3. Scroll to newest message
+                scrollEl.scrollTop = scrollEl.scrollHeight;
+            }
+        }
 
         fixChatLayout();
-        setTimeout(fixChatLayout, 150);
+        [80, 300, 700, 1500].forEach(function(t) { setTimeout(fixChatLayout, t); });
 
-        var sidebar = doc.querySelector('[data-testid="stSidebar"]');
-        if (sidebar) new ResizeObserver(fixChatLayout).observe(sidebar);
-        window.parent.addEventListener('resize', fixChatLayout);
-    }})();
+        win.addEventListener('resize', fixChatLayout);
+        var sb = doc.querySelector('[data-testid="stSidebar"]');
+        if (sb && win.ResizeObserver) new win.ResizeObserver(fixChatLayout).observe(sb);
+    })();
     </script>""", height=0)
 
 
